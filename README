@@ -1,3 +1,10 @@
+THIS IS THE SPOOFING BRANCH!
+
+This is a fork of the android emulator that allows you to spoof IMEI, IMSI, and phone number.  
+
+Original README below
+----------------
+
 This package contains the sources to the Android emulator program.
 
 This program emulates a virtual ARM board that can be used to run Android
