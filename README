@@ -1,7 +1,10 @@
 THIS IS THE SPOOFING BRANCH!
 
-This is a fork of the android emulator that allows you to spoof IMEI, IMSI, and phone number.  
+This is a fork of the android emulator that allows you to spoof IMEI, IMSI, and phone number.  You should be using this with r10 of the Android SDK.
 
+Use the command line options -imei, -imsi, and -phone-number
+
+Don't forget to set the ANDROID_SDK_ROOT environment variable to wherever the rest of the SDK is.
 -- Maxim Veytsman
 
 Original README below

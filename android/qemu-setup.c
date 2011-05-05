@@ -45,6 +45,12 @@ char* op_http_proxy = NULL;
 /* Base port for the emulated system. */
 int    android_base_port;
 
+/* simulted IMEI */
+char* imei;
+/* simulted IMSI */
+char* imsi;
+
+
 /*** APPLICATION DIRECTORY
  *** Where are we ?
  ***/
@@ -328,7 +334,7 @@ void  android_emulation_setup( void )
         report_console(android_op_report_console, base_port);
     }
 
-    android_modem_init( base_port );
+    android_modem_init( base_port, imei, imsi );
 
     /* Save base port. */
     android_base_port = base_port;
