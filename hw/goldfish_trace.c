@@ -22,7 +22,23 @@
 #include "memcheck/memcheck_util.h"
 #endif  // CONFIG_MEMCHECK
 
-//#define DEBUG   1
+/* Set to 1 to debug tracing */
+#define DEBUG   0
+
+#if DEBUG
+#  define D(...)  printf(__VA_ARGS__), fflush(stdout)
+#else
+#  define D(...)  ((void)0)
+#endif
+
+/* Set to 1 to debug PID tracking */
+#define  DEBUG_PID  0
+
+#if DEBUG_PID
+#  define  DPID(...)  printf(__VA_ARGS__), fflush(stdout)
+#else
+#  define  DPID(...)  ((void)0)
+#endif
 
 extern void cpu_loop_exit(void);
 
@@ -38,6 +54,7 @@ static unsigned long eoff;      // offset in EXE file
 static unsigned cmdlen;         // cmdline length
 static unsigned pid;            // PID (really thread id)
 static unsigned tgid;           // thread group id (really process id)
+static unsigned tid;            // current thread id (same as pid, most of the time)
 static unsigned long dsaddr;    // dynamic symbol address
 static unsigned long unmap_start; // start address to unmap
 
@@ -53,32 +70,30 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
 
     switch (offset >> 2) {
     case TRACE_DEV_REG_SWITCH:  // context switch, switch to pid
+        DPID("QEMU.trace: context switch tid=%u\n", value);
         if (trace_filename != NULL) {
             trace_switch(value);
-#ifdef DEBUG
-            printf("QEMU.trace: kernel, context switch %u\n", value);
-#endif
+            D("QEMU.trace: kernel, context switch %u\n", value);
         }
 #ifdef CONFIG_MEMCHECK
         if (memcheck_enabled) {
             memcheck_switch(value);
         }
 #endif  // CONFIG_MEMCHECK
+        tid = (unsigned) value;
         break;
     case TRACE_DEV_REG_TGID:    // save the tgid for the following fork/clone
+        DPID("QEMU.trace: tgid=%u\n", value);
         tgid = value;
-#ifdef DEBUG
         if (trace_filename != NULL) {
-            printf("QEMU.trace: kernel, tgid %u\n", value);
+            D("QEMU.trace: kernel, tgid %u\n", value);
         }
-#endif
         break;
     case TRACE_DEV_REG_FORK:    // fork, fork new pid
+        DPID("QEMU.trace: fork (pid=%d tgid=%d value=%d)\n", pid, tgid, value);
         if (trace_filename != NULL) {
             trace_fork(tgid, value);
-#ifdef DEBUG
-            printf("QEMU.trace: kernel, fork %u\n", value);
-#endif
+            D("QEMU.trace: kernel, fork %u\n", value);
         }
 #ifdef CONFIG_MEMCHECK
         if (memcheck_enabled) {
@@ -87,11 +102,10 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
 #endif  // CONFIG_MEMCHECK
         break;
     case TRACE_DEV_REG_CLONE:    // fork, clone new pid (i.e. thread)
+        DPID("QEMU.trace: clone (pid=%d tgid=%d value=%d)\n", pid, tgid, value);
         if (trace_filename != NULL) {
             trace_clone(tgid, value);
-#ifdef DEBUG
-            printf("QEMU.trace: kernel, clone %u\n", value);
-#endif
+            D("QEMU.trace: kernel, clone %u\n", value);
         }
 #ifdef CONFIG_MEMCHECK
         if (memcheck_enabled) {
@@ -112,10 +126,8 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
         vstrcpy(value, exec_path, CLIENT_PAGE_SIZE);
         if (trace_filename != NULL) {
             trace_init_exec(vstart, vend, eoff, exec_path);
-#ifdef DEBUG
-            printf("QEMU.trace: kernel, init exec [%lx,%lx]@%lx [%s]\n",
-                   vstart, vend, eoff, exec_path);
-#endif
+            D("QEMU.trace: kernel, init exec [%lx,%lx]@%lx [%s]\n",
+              vstart, vend, eoff, exec_path);
         }
 #ifdef CONFIG_MEMCHECK
         if (memcheck_enabled) {
@@ -142,7 +154,7 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
             memcheck_set_cmd_line(exec_arg, cmdlen);
         }
 #endif  // CONFIG_MEMCHECK
-#ifdef DEBUG
+#if DEBUG || DEBUG_PID
         if (trace_filename != NULL) {
             int i;
             for (i = 0; i < cmdlen; i ++)
@@ -154,11 +166,10 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
 #endif
         break;
     case TRACE_DEV_REG_EXIT:            // exit, exit current process with exit code
+        DPID("QEMU.trace: exit tid=%u\n", value);
         if (trace_filename != NULL) {
             trace_exit(value);
-#ifdef DEBUG
-            printf("QEMU.trace: kernel, exit %x\n", value);
-#endif
+            D("QEMU.trace: kernel, exit %x\n", value);
         }
 #ifdef CONFIG_MEMCHECK
         if (memcheck_enabled) {
@@ -168,6 +179,7 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
         break;
     case TRACE_DEV_REG_NAME:            // record thread name
         vstrcpy(value, exec_path, CLIENT_PAGE_SIZE);
+        DPID("QEMU.trace: thread name=%s\n", exec_path);
 
         // Remove the trailing newline if it exists
         int len = strlen(exec_path);
@@ -176,18 +188,15 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
         }
         if (trace_filename != NULL) {
             trace_name(exec_path);
-#ifdef DEBUG
-            printf("QEMU.trace: kernel, name %s\n", exec_path);
-#endif
+            D("QEMU.trace: kernel, name %s\n", exec_path);
         }
         break;
     case TRACE_DEV_REG_MMAP_EXEPATH:    // mmap, path of EXE, the others are same as execve
         vstrcpy(value, exec_path, CLIENT_PAGE_SIZE);
+        DPID("QEMU.trace: mmap exe=%s\n", exec_path);
         if (trace_filename != NULL) {
             trace_mmap(vstart, vend, eoff, exec_path);
-#ifdef DEBUG
-            printf("QEMU.trace: kernel, mmap [%lx,%lx]@%lx [%s]\n", vstart, vend, eoff, exec_path);
-#endif
+            D("QEMU.trace: kernel, mmap [%lx,%lx]@%lx [%s]\n", vstart, vend, eoff, exec_path);
         }
 #ifdef CONFIG_MEMCHECK
         if (memcheck_enabled) {
@@ -203,6 +212,7 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
         break;
     case TRACE_DEV_REG_INIT_PID:        // init, name the pid that starts before device registered
         pid = value;
+        DPID("QEMU.trace: pid=%d\n", value);
 #ifdef CONFIG_MEMCHECK
         if (memcheck_enabled) {
             memcheck_init_pid(value);
@@ -211,11 +221,10 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
         break;
     case TRACE_DEV_REG_INIT_NAME:       // init, the comm of the init pid
         vstrcpy(value, exec_path, CLIENT_PAGE_SIZE);
+        DPID("QEMU.trace: tgid=%d pid=%d name=%s\n", tgid, pid, exec_path);
         if (trace_filename != NULL) {
             trace_init_name(tgid, pid, exec_path);
-#ifdef DEBUG
-            printf("QEMU.trace: kernel, init name %u [%s]\n", pid, exec_path);
-#endif
+            D("QEMU.trace: kernel, init name %u [%s]\n", pid, exec_path);
         }
         exec_path[0] = 0;
         break;
@@ -227,18 +236,14 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
         vstrcpy(value, exec_arg, CLIENT_PAGE_SIZE);
         if (trace_filename != NULL) {
             trace_dynamic_symbol_add(dsaddr, exec_arg);
-#ifdef DEBUG
-            printf("QEMU.trace: dynamic symbol %lx:%s\n", dsaddr, exec_arg);
-#endif
+            D("QEMU.trace: dynamic symbol %lx:%s\n", dsaddr, exec_arg);
         }
         exec_arg[0] = 0;
         break;
     case TRACE_DEV_REG_REMOVE_ADDR:         // remove dynamic symbol addr
         if (trace_filename != NULL) {
             trace_dynamic_symbol_remove(value);
-#ifdef DEBUG
-            printf("QEMU.trace: dynamic symbol remove %lx\n", dsaddr);
-#endif
+            D("QEMU.trace: dynamic symbol remove %lx\n", dsaddr);
         }
         break;
 
@@ -346,6 +351,9 @@ static void trace_dev_write(void *opaque, target_phys_addr_t offset, uint32_t va
     default:
         if (offset < 4096) {
             cpu_abort(cpu_single_env, "trace_dev_write: Bad offset %x\n", offset);
+        } else {
+            D("%s: offset=%d (0x%x) value=%d (0x%x)\n", __FUNCTION__, offset,
+              offset, value, value);
         }
         break;
     }
@@ -361,9 +369,12 @@ static uint32_t trace_dev_read(void *opaque, target_phys_addr_t offset)
     switch (offset >> 2) {
     case TRACE_DEV_REG_ENABLE:          // tracing enable
         return tracing;
+
     default:
         if (offset < 4096) {
             cpu_abort(cpu_single_env, "trace_dev_read: Bad offset %x\n", offset);
+        } else {
+            D("%s: offset=%d (0x%x)\n", __FUNCTION__, offset, offset);
         }
         return 0;
     }

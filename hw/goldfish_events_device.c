@@ -19,10 +19,6 @@
 
 #define MAX_EVENTS 256*4
 
-/* Defined in vl-android.c */
-extern int android_display_width;
-extern int android_display_height;
-
 enum {
     REG_READ        = 0x00,
     REG_SET_PAGE    = 0x00,
@@ -473,14 +469,14 @@ void events_dev_init(uint32_t base, qemu_irq irq)
 
         /* ABS_X min/max/fuzz/flat */
         values[0] = 0;
-        values[1] = android_display_width-1;
+        values[1] = config->hw_lcd_width-1;
         values[2] = 0;
         values[3] = 0;
         values   += 4;
 
         /* ABS_Y */
         values[0] = 0;
-        values[1] = android_display_height-1;
+        values[1] = config->hw_lcd_height-1;
         values[2] = 0;
         values[3] = 0;
         values   += 4;

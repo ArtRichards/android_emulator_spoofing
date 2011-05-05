@@ -21,6 +21,7 @@
 #include "arm-misc.h"
 #include "console.h"
 #include "blockdev.h"
+#include "goldfish_pipe.h"
 #ifdef CONFIG_MEMCHECK
 #include "memcheck/memcheck_api.h"
 #endif  // CONFIG_MEMCHECK
@@ -155,6 +156,8 @@ static void android_arm_init_(ram_addr_t ram_size,
         D("Trace file name is not set\n");
     }
 #endif
+
+    pipe_dev_init();
 
 #if TEST_SWITCH
     {

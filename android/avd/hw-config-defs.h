@@ -17,6 +17,20 @@
 #error  HWCFG_DOUBLE not defined
 #endif
 
+HWCFG_STRING(
+  hw_cpu_arch,
+  "hw.cpu.arch",
+  "arm",
+  "CPU Architecture",
+  "The CPU Architecture to emulator")
+
+HWCFG_STRING(
+  hw_cpu_model,
+  "hw.cpu.model",
+  "",
+  "CPU model",
+  "The CPU model (QEMU-specific string)")
+
 HWCFG_INT(
   hw_ramSize,
   "hw.ramSize",
@@ -129,12 +143,26 @@ HWCFG_BOOL(
   "SD Card support",
   "Whether the device supports insertion/removal of virtual SD Cards.")
 
+HWCFG_STRING(
+  hw_sdCard_path,
+  "hw.sdCard.path",
+  "",
+  "SD Card image path",
+  "")
+
 HWCFG_BOOL(
   disk_cachePartition,
   "disk.cachePartition",
   "yes",
   "Cache partition support",
   "Whether we use a /cache partition on the device.")
+
+HWCFG_STRING(
+  disk_cachePartition_path,
+  "disk.cachePartition.path",
+  "",
+  "Cache partition",
+  "Cache partition to use on the device. Ignored if disk.cachePartition is not 'yes'.")
 
 HWCFG_DISKSIZE(
   disk_cachePartition_size,
@@ -144,16 +172,44 @@ HWCFG_DISKSIZE(
   "")
 
 HWCFG_INT(
+  hw_lcd_width,
+  "hw.lcd.width",
+  320,
+  "LCD pixel width",
+  "")
+
+HWCFG_INT(
+  hw_lcd_height,
+  "hw.lcd.height",
+  640,
+  "LCD pixel height",
+  "")
+
+HWCFG_INT(
+  hw_lcd_depth,
+  "hw.lcd.depth",
+  16,
+  "LCD color depth",
+  "Must be 16 or 32. Color bit depth of emulated framebuffer.")
+
+HWCFG_INT(
   hw_lcd_density,
   "hw.lcd.density",
   160,
   "Abstracted LCD density",
   "Must be one of 120, 160 or 240. A value used to roughly describe the density of the LCD screen for automatic resource/asset selection.")
 
+HWCFG_BOOL(
+  hw_lcd_backlight,
+  "hw.lcd.backlight",
+  "yes",
+  "LCD backlight",
+  "Enable/Disable LCD backlight simulation,yes-enabled,no-disabled.")
+
 HWCFG_INT(
   vm_heapSize,
   "vm.heapSize",
-  16,
+  0,
   "Max VM application heap size",
   "The maximum heap size a Dalvik application might allocate before being killed by the system. Value is in megabytes.")
 
@@ -163,6 +219,83 @@ HWCFG_BOOL(
   "yes",
   "Proximity support",
   "Whether there is an proximity in the device.")
+
+HWCFG_STRING(
+  kernel_path,
+  "kernel.path",
+  "",
+  "Path to the kernel image",
+  "Path to the kernel image.")
+
+HWCFG_STRING(
+  kernel_parameters,
+  "kernel.parameters",
+  "",
+  "kernel boot parameters string.",
+  "")
+
+HWCFG_STRING(
+  disk_ramdisk_path,
+  "disk.ramdisk.path",
+  "",
+  "Path to the ramdisk image",
+  "Path to the ramdisk image.")
+
+HWCFG_STRING(
+  disk_systemPartition_path,
+  "disk.systemPartition.path",
+  "",
+  "Path to runtime system partition image",
+  "")
+
+HWCFG_STRING(
+  disk_systemPartition_initPath,
+  "disk.systemPartition.initPath",
+  "",
+  "Initial system partition image",
+  "")
+
+HWCFG_DISKSIZE(
+  disk_systemPartition_size,
+  "disk.systemPartition.size",
+  "0",
+  "Ideal size of system partition",
+  "")
+
+HWCFG_STRING(
+  disk_dataPartition_path,
+  "disk.dataPartition.path",
+  "<temp>",
+  "Path to data partition file",
+  "Path to data partition file. Cannot be empty. Special value <temp> means using a temporary file. If disk.dataPartition.initPath is not empty, its content will be copied to the disk.dataPartition.path file at boot-time.")
+
+HWCFG_STRING(
+  disk_dataPartition_initPath,
+  "disk.dataPartition.initPath",
+  "",
+  "Initial data partition",
+  "If not empty, its content will be copied to the disk.dataPartition.path file at boot-time.")
+
+HWCFG_DISKSIZE(
+  disk_dataPartition_size,
+  "disk.dataPartition.size",
+  "0",
+  "Ideal size of data partition",
+  "")
+
+HWCFG_STRING(
+  disk_snapStorage_path,
+  "disk.snapStorage.path",
+  "",
+  "Path to snapshot storage",
+  "Path to a 'snapshot storage' file, where all snapshots are stored.")
+
+HWCFG_STRING(
+  avd_name,
+  "avd.name",
+  "<build>",
+  "Name of the AVD being run",
+  "")
 
 #undef HWCFG_INT
 #undef HWCFG_BOOL

@@ -51,13 +51,20 @@
 #include "charpipe.h"
 #include "modem_driver.h"
 #include "android/gps.h"
-#include "android/hw-qemud.h"
 #include "android/hw-kmsg.h"
+#include "android/hw-pipe-net.h"
+#include "android/hw-qemud.h"
 #include "android/charmap.h"
 #include "android/globals.h"
 #include "android/utils/bufprint.h"
+#include "android/utils/debug.h"
+#include "android/utils/filelock.h"
+#include "android/utils/path.h"
+#include "android/utils/stralloc.h"
+#include "android/utils/tempfile.h"
 #include "android/display-core.h"
 #include "android/utils/timezone.h"
+#include "android/snapshot.h"
 #include "targphys.h"
 #include "tcpdump.h"
 
@@ -191,6 +198,7 @@
 #include "balloon.h"
 #include "android/hw-lcd.h"
 #include "android/boot-properties.h"
+#include "android/hw-control.h"
 #include "android/core-init-utils.h"
 #include "android/audio-test.h"
 
@@ -278,6 +286,8 @@ static int no_frame = 0;
 #endif
 int no_quit = 0;
 CharDriverState *serial_hds[MAX_SERIAL_PORTS];
+int              serial_hds_count;
+
 CharDriverState *parallel_hds[MAX_PARALLEL_PORTS];
 CharDriverState *virtcon_hds[MAX_VIRTIO_CONSOLES];
 #ifdef TARGET_I386
@@ -337,9 +347,6 @@ extern char* android_op_report_console;
 extern char* op_http_proxy;
 // Path to the file containing specific key character map.
 char* op_charmap_file = NULL;
-
-/* Framebuffer dimensions, passed with -android-gui option. */
-char* android_op_gui = NULL;
 
 /* Path to hardware initialization file passed with -android-hw option. */
 char* android_op_hwini = NULL;
@@ -401,9 +408,11 @@ extern int android_display_bpp;
 
 extern void  dprint( const char* format, ... );
 
-#if CONFIG_ANDROID_SNAPSHOTS
+const char* dns_log_filename = NULL;
+const char* drop_log_filename = NULL;
+static int rotate_logs_requested = 0;
+
 const char* savevm_on_exit = NULL;
-#endif
 
 #define TFR(expr) do { if ((expr) != -1) break; } while (errno == EINTR)
 
@@ -509,40 +518,50 @@ static void default_ioport_writel(void *opaque, uint32_t address, uint32_t data)
 #endif
 }
 
-/* Parses -android-gui command line option, extracting width, height and bits
- * per pixel parameters for the GUI console used in this session of the
- * emulator. -android-gui option contains exactly three comma-separated positive
- * integer numbers in strict order: width goes first, width goes next, and bits
- * per pixel goes third. This routine verifies that format and return 0 if all
- * three numbers were extracted, or -1 if string format was incorrect for that
- * option. Note that this routine does not verify that extracted values are
- * correct!
+/*
+ * Sets a flag (rotate_logs_requested) to clear both the DNS and the
+ * drop logs upon receiving a SIGUSR1 signal. We need to clear the logs
+ * between the tasks that do not require restarting Qemu.
  */
-static int
-parse_androig_gui_option(const char* op, int* width, int* height, int* bpp)
-{
-    char val[128];
+void rotate_qemu_logs_handler(int signum) {
+  rotate_logs_requested = 1;
+}
 
-    if (get_param_value(val, 128, "width", op)) {
-        *width = strtol(val, NULL, 0);
-    } else {
-        fprintf(stderr, "option -android-gui is missing width parameter\n");
-        return -1;
-    }
-    if (get_param_value(val, 128, "height", op)) {
-        *height = strtol(val, NULL, 0);
-    } else {
-        fprintf(stderr, "option -android-gui is missing height parameter\n");
-        return -1;
-    }
-    if (get_param_value(val, 128, "bpp", op)) {
-        *bpp = strtol(val, NULL, 0);
-    } else {
-        fprintf(stderr, "option -android-gui is missing bpp parameter\n");
-        return -1;
-    }
+/*
+ * Resets the rotate_log_requested_flag. Normally called after qemu
+ * logs has been rotated.
+ */
+void reset_rotate_qemu_logs_request(void) {
+  rotate_logs_requested = 0;
+}
 
-    return 0;
+/*
+ * Clears the passed qemu log when the rotate_logs_requested
+ * is set. We need to clear the logs between the tasks that do not
+ * require restarting Qemu.
+ */
+FILE* rotate_qemu_log(FILE* old_log_fd, const char* filename) {
+  FILE* new_log_fd = NULL;
+  if (old_log_fd) {
+    if (fclose(old_log_fd) == -1) {
+      fprintf(stderr, "Cannot close old_log fd\n");
+      exit(errno);
+    }
+  }
+
+  if (!filename) {
+    fprintf(stderr, "The log filename to be rotated is not provided");
+    exit(-1);
+  }
+
+  new_log_fd = fopen(filename , "wb+");
+  if (new_log_fd == NULL) {
+    fprintf(stderr, "Cannot open the log file: %s for write.\n",
+            filename);
+    exit(1);
+  }
+
+  return new_log_fd;
 }
 
 /***********************************************************/
@@ -3155,6 +3174,17 @@ static void main_loop(void)
 #ifdef CONFIG_PROFILER
             dev_time += profile_getclock() - ti;
 #endif
+
+            if (rotate_logs_requested) {
+                FILE* new_dns_log_fd = rotate_qemu_log(get_slirp_dns_log_fd(),
+                                                        dns_log_filename);
+                FILE* new_drop_log_fd = rotate_qemu_log(get_slirp_drop_log_fd(),
+                                                         drop_log_filename);
+                slirp_dns_log_fd(new_dns_log_fd);
+                slirp_drop_log_fd(new_drop_log_fd);
+                reset_rotate_qemu_logs_request();
+            }
+
         } while (vm_can_run());
 
         if (qemu_debug_requested())
@@ -3164,11 +3194,9 @@ static void main_loop(void)
                 vm_stop(0);
                 no_shutdown = 0;
             } else {
-#if CONFIG_ANDROID_SNAPSHOTS
                 if (savevm_on_exit != NULL) {
                   do_savevm(cur_mon, savevm_on_exit);
                 }
-#endif
                 break;
             }
         }
@@ -3521,9 +3549,11 @@ static char *find_datadir(const char *argv0)
 
 /* Find a likely location for support files using the location of the binary.
    For installed binaries this will be "$bindir/../share/qemu".  When
-   running from the build tree this will be "$bindir/../pc-bios".  */
+   running from the build tree this will be "$bindir/../pc-bios".
+   The emulator running from the SDK will find the support files in $bindir/lib/pc-bios. */
 #define SHARE_SUFFIX "/share/qemu"
 #define BUILD_SUFFIX "/pc-bios"
+#define SDK_SUFFIX "/lib/pc-bios"
 static char *find_datadir(const char *argv0)
 {
     char *dir;
@@ -3564,19 +3594,25 @@ static char *find_datadir(const char *argv0)
             return NULL;
         }
     }
-    dir = dirname(p);
-    dir = dirname(dir);
 
-    max_len = strlen(dir) +
-        MAX(strlen(SHARE_SUFFIX), strlen(BUILD_SUFFIX)) + 1;
+#define STRLEN_CONST(str) (sizeof(str)-1)
+    dir = dirname(p);
+    max_len = strlen(dir) + 1 +
+        MAX(STRLEN_CONST(SDK_SUFFIX), MAX(STRLEN_CONST(SHARE_SUFFIX), STRLEN_CONST(BUILD_SUFFIX)));
     res = qemu_mallocz(max_len);
-    snprintf(res, max_len, "%s%s", dir, SHARE_SUFFIX);
+
+    snprintf(res, max_len, "%s%s", dir, SDK_SUFFIX);
     if (access(res, R_OK)) {
-        snprintf(res, max_len, "%s%s", dir, BUILD_SUFFIX);
-        if (access(res, R_OK)) {
-            qemu_free(res);
-            res = NULL;
-        }
+      dir = dirname(dir);
+
+      snprintf(res, max_len, "%s%s", dir, SHARE_SUFFIX);
+      if (access(res, R_OK)) {
+          snprintf(res, max_len, "%s%s", dir, BUILD_SUFFIX);
+          if (access(res, R_OK)) {
+              qemu_free(res);
+              res = NULL;
+          }
+      }
     }
 #ifndef PATH_MAX
     free(p);
@@ -3641,22 +3677,226 @@ add_dns_server( const char*  server_name )
     return 0;
 }
 
-/* Appends a parameter to a string of parameters separated with space.
+/* Parses an integer
  * Pararm:
- *  param_str String containing parameters separated with space.
- *  param Parameter to append to the string.
- *  size - Size (in characters) of the buffer addressed by param_str.
+ *  str      String containing a number to be parsed.
+ *  result   Passes the parsed integer in this argument
+ *  returns  0 if ok, -1 if failed
+ */
+int
+parse_int(const char *str, int *result)
+{
+    char* r;
+    *result = strtol(str, &r, 0);
+    if (r == NULL || *r != '\0')
+      return -1;
+
+    return 0;
+}
+
+#ifndef _WIN32
+/*
+ * Initializes the SIGUSR1 signal handler to clear Qemu logs.
+ */
+void init_qemu_clear_logs_sig() {
+  struct sigaction act;
+  sigfillset(&act.sa_mask);
+  act.sa_flags = 0;
+  act.sa_handler = rotate_qemu_logs_handler;
+  if (sigaction(SIGUSR1, &act, NULL) == -1) {
+    fprintf(stderr, "Failed to setup SIGUSR1 handler to clear Qemu logs\n");
+    exit(-1);
+  }
+}
+#endif
+
+
+
+/* parses a null-terminated string specifying a network port (e.g., "80") or
+ * port range (e.g., "[6666-7000]"). In case of a single port, lport and hport
+ * are the same. Returns 0 on success, -1 on error. */
+
+int parse_port_range(const char *str, unsigned short *lport,
+                     unsigned short *hport) {
+
+  unsigned int low = 0, high = 0;
+  char *p, *arg = strdup(str);
+
+  if ((*arg == '[') && ((p = strrchr(arg, ']')) != NULL)) {
+    p = arg + 1;   /* skip '[' */
+    low  = atoi(strtok(p, "-"));
+    high = atoi(strtok(NULL, "-"));
+    if ((low > 0) && (high > 0) && (low < high) && (high < 65535)) {
+      *lport = low;
+      *hport = high;
+    }
+  }
+  else {
+    low = atoi(arg);
+    if ((0 < low) && (low < 65535)) {
+      *lport = low;
+      *hport = low;
+    }
+  }
+  free(arg);
+  if (low != 0)
+    return 0;
+  return -1;
+}
+
+/*
+ * Implements the generic port forwarding option
+ */
+void
+net_slirp_forward(const char *optarg)
+{
+    /*
+     * we expect the following format:
+     * dst_net:dst_mask:dst_port:redirect_ip:redirect_port OR
+     * dst_net:dst_mask:[dp_range_start-dp_range_end]:redirect_ip:redirect_port
+     */
+    char *argument = strdup(optarg), *p = argument;
+    char *dst_net, *dst_mask, *dst_port;
+    char *redirect_ip, *redirect_port;
+    uint32_t dnet, dmask, rip;
+    unsigned short dlport, dhport, rport;
+
+
+    dst_net = strtok(p, ":");
+    dst_mask = strtok(NULL, ":");
+    dst_port = strtok(NULL, ":");
+    redirect_ip = strtok(NULL, ":");
+    redirect_port = strtok(NULL, ":");
+
+    if (dst_net == NULL || dst_mask == NULL || dst_port == NULL ||
+        redirect_ip == NULL || redirect_port == NULL) {
+        fprintf(stderr,
+                "Invalid argument for -net-forward, we expect "
+                "dst_net:dst_mask:dst_port:redirect_ip:redirect_port or "
+                "dst_net:dst_mask:[dp_range_start-dp_range_end]"
+                ":redirect_ip:redirect_port: %s\n",
+                optarg);
+        exit(1);
+    }
+
+    /* inet_strtoip converts dotted address to host byte order */
+    if (inet_strtoip(dst_net, &dnet) == -1) {
+        fprintf(stderr, "Invalid destination IP net: %s\n", dst_net);
+        exit(1);
+    }
+    if (inet_strtoip(dst_mask, &dmask) == -1) {
+        fprintf(stderr, "Invalid destination IP mask: %s\n", dst_mask);
+        exit(1);
+    }
+    if (inet_strtoip(redirect_ip, &rip) == -1) {
+        fprintf(stderr, "Invalid redirect IP address: %s\n", redirect_ip);
+        exit(1);
+    }
+
+    if (parse_port_range(dst_port, &dlport, &dhport) == -1) {
+        fprintf(stderr, "Invalid destination port or port range\n");
+        exit(1);
+    }
+
+    rport = atoi(redirect_port);
+    if (!rport) {
+        fprintf(stderr, "Invalid redirect port: %s\n", redirect_port);
+        exit(1);
+    }
+
+    dnet &= dmask;
+
+    slirp_add_net_forward(dnet, dmask, dlport, dhport,
+                          rip, rport);
+
+    free(argument);
+}
+
+
+/* Parses an -allow-tcp or -allow-udp argument and inserts a corresponding
+ * entry in the allows list */
+void
+slirp_allow(const char *optarg, u_int8_t proto)
+{
+  /*
+   * we expect the following format:
+   * dst_ip:dst_port OR dst_ip:[dst_lport-dst_hport]
+   */
+  char *argument = strdup(optarg), *p = argument;
+  char *dst_ip_str, *dst_port_str;
+  uint32_t dst_ip;
+  unsigned short dst_lport, dst_hport;
+
+  dst_ip_str = strtok(p, ":");
+  dst_port_str = strtok(NULL, ":");
+
+  if (dst_ip_str == NULL || dst_port_str == NULL) {
+    fprintf(stderr,
+            "Invalid argument %s for -allow. We expect "
+            "dst_ip:dst_port or dst_ip:[dst_lport-dst_hport]\n",
+            optarg);
+    exit(1);
+  }
+
+  if (inet_strtoip(dst_ip_str, &dst_ip) == -1) {
+    fprintf(stderr, "Invalid destination IP address: %s\n", dst_ip_str);
+    exit(1);
+  }
+  if (parse_port_range(dst_port_str, &dst_lport, &dst_hport) == -1) {
+    fprintf(stderr, "Invalid destination port or port range\n");
+    exit(1);
+  }
+
+  slirp_add_allow(dst_ip, dst_lport, dst_hport, proto);
+
+  free(argument);
+}
+
+/* Add a serial device at a given location in the emulated hardware table.
+ * On failure, this function aborts the program with an error message.
  */
 static void
-append_param(char* param_str, const char* arg, int size)
+serial_hds_add_at(int  index, const char* devname)
 {
-    if (*param_str) {
-        strncat(param_str, " ", size);
-        strncat(param_str, arg, size);
-    } else {
-        strncpy(param_str, arg, size);
-        param_str[size - 1] = '\0';
+    char label[32];
+
+    if (!devname || !strcmp(devname,"none"))
+        return;
+
+    if (index >= MAX_SERIAL_PORTS) {
+        PANIC("qemu: invalid serial index for %s (%d >= %d)",
+              devname, index, MAX_SERIAL_PORTS);
     }
+    if (serial_hds[index] != NULL) {
+        PANIC("qemu: invalid serial index for %s (%d: already taken!)",
+              devname, index);
+    }
+    snprintf(label, sizeof(label), "serial%d", index);
+    serial_hds[index] = qemu_chr_open(label, devname, NULL);
+    if (!serial_hds[index]) {
+        PANIC("qemu: could not open serial device '%s'", devname);
+    }
+}
+
+
+/* Find a free slot in the emulated serial device table, and register
+ * it. Return the allocated table index.
+ */
+static int
+serial_hds_add(const char* devname)
+{
+    int  index;
+
+    /* Find first free slot */
+    for (index = 0; index < MAX_SERIAL_PORTS; index++) {
+        if (serial_hds[index] == NULL) {
+            serial_hds_add_at(index, devname);
+            return index;
+        }
+    }
+
+    PANIC("qemu: too many serial devices registered (%d)", index);
+    return -1;  /* shouldn't happen */
 }
 
 int main(int argc, char **argv, char **envp)
@@ -3673,6 +3913,7 @@ int main(int argc, char **argv, char **envp)
     DisplayChangeListener *dcl;
     int cyls, heads, secs, translation;
     QemuOpts *hda_opts = NULL;
+    QemuOpts *hdb_opts = NULL;
     const char *net_clients[MAX_NET_CLIENTS];
     int nb_net_clients;
     const char *bt_opts[MAX_BT_CMDLINE];
@@ -3706,16 +3947,9 @@ int main(int argc, char **argv, char **envp)
 #endif
     CPUState *env;
     int show_vnc_port = 0;
-#ifdef CONFIG_STANDALONE_CORE
     IniFile*  hw_ini = NULL;
-#endif  // CONFIG_STANDALONE_CORE
-    /* Container for the kernel initialization parameters collected in this
-     * routine. */
-    char kernel_cmdline_append[1024];
-    /* Combines kernel initialization parameters passed from the UI with
-     * the parameters collected in this routine. */
-    char kernel_cmdline_full[1024];
-    char tmp_str[1024];
+    STRALLOC_DEFINE(kernel_params);
+    STRALLOC_DEFINE(kernel_config);
     int    dns_count = 0;
 
     /* Initialize sockets before anything else, so we can properly report
@@ -3767,8 +4001,7 @@ int main(int argc, char **argv, char **envp)
     snapshot = 0;
     kernel_filename = NULL;
     kernel_cmdline = "";
-    kernel_cmdline_append[0] = '\0';
-    kernel_cmdline_full[0] = '\0';
+
     cyls = heads = secs = 0;
     translation = BIOS_ATA_TRANSLATION_AUTO;
     monitor_device = "vc:80Cx24C";
@@ -3811,6 +4044,8 @@ int main(int argc, char **argv, char **envp)
 
     /* Initialize boot properties. */
     boot_property_init_service();
+    android_hw_control_init();
+    android_net_pipes_init();
 
     optind = 1;
     for(;;) {
@@ -3893,6 +4128,9 @@ int main(int argc, char **argv, char **envp)
                                  ",trans=none" : "");
                  break;
             case QEMU_OPTION_hdb:
+                hdb_opts = drive_add(optarg, HD_ALIAS, 1);
+                break;
+
             case QEMU_OPTION_hdc:
             case QEMU_OPTION_hdd:
                 drive_add(optarg, HD_ALIAS, popt->index - QEMU_OPTION_hda);
@@ -4235,11 +4473,9 @@ int main(int argc, char **argv, char **envp)
             case QEMU_OPTION_loadvm:
                 loadvm = optarg;
                 break;
-#if CONFIG_ANDROID_SNAPSHOTS
             case QEMU_OPTION_savevm_on_exit:
                 savevm_on_exit = optarg;
                 break;
-#endif
             case QEMU_OPTION_full_screen:
                 full_screen = 1;
                 break;
@@ -4288,6 +4524,7 @@ int main(int argc, char **argv, char **envp)
                 kqemu_allowed = 2;
                 break;
 #endif
+#ifdef TARGET_I386
 #ifdef CONFIG_KVM
             case QEMU_OPTION_enable_kvm:
                 kvm_allowed = 1;
@@ -4296,6 +4533,7 @@ int main(int argc, char **argv, char **envp)
 #endif
                 break;
 #endif
+#endif  /* TARGET_I386 */
             case QEMU_OPTION_usb:
                 usb_enabled = 1;
                 break;
@@ -4416,6 +4654,91 @@ int main(int argc, char **argv, char **envp)
                     }
                 }
                 break;
+
+            /* -------------------------------------------------------*/
+            /* User mode network stack restrictions */
+            case QEMU_OPTION_drop_udp:
+                slirp_drop_udp();
+                break;
+            case QEMU_OPTION_drop_tcp:
+                slirp_drop_tcp();
+                break;
+            case QEMU_OPTION_allow_tcp:
+                slirp_allow(optarg, IPPROTO_TCP);
+                break;
+            case QEMU_OPTION_allow_udp:
+                slirp_allow(optarg, IPPROTO_UDP);
+                break;
+             case QEMU_OPTION_drop_log:
+                {
+                    FILE* drop_log_fd;
+                    drop_log_filename = optarg;
+                    drop_log_fd = fopen(optarg, "w+");
+
+                    if (!drop_log_fd) {
+                        fprintf(stderr, "Cannot open drop log: %s\n", optarg);
+                        exit(1);
+                    }
+
+                    slirp_drop_log_fd(drop_log_fd);
+                }
+                break;
+
+            case QEMU_OPTION_dns_log:
+                {
+                    FILE* dns_log_fd;
+                    dns_log_filename = optarg;
+                    dns_log_fd = fopen(optarg, "wb+");
+
+                    if (dns_log_fd == NULL) {
+                        fprintf(stderr, "Cannot open dns log: %s\n", optarg);
+                        exit(1);
+                    }
+
+                    slirp_dns_log_fd(dns_log_fd);
+                }
+                break;
+
+
+            case QEMU_OPTION_max_dns_conns:
+                {
+                    int max_dns_conns = 0;
+                    if (parse_int(optarg, &max_dns_conns)) {
+                      fprintf(stderr,
+                              "qemu: syntax: -max-dns-conns max_connections\n");
+                      exit(1);
+                    }
+                    if (max_dns_conns <= 0 ||  max_dns_conns == LONG_MAX) {
+                      fprintf(stderr,
+                              "Invalid arg for max dns connections: %s\n",
+                              optarg);
+                      exit(1);
+                    }
+                    slirp_set_max_dns_conns(max_dns_conns);
+                }
+                break;
+
+            case QEMU_OPTION_net_forward:
+                net_slirp_forward(optarg);
+                break;
+            case QEMU_OPTION_net_forward_tcp2sink:
+                {
+                    SockAddress saddr;
+
+                    if (parse_host_port(&saddr, optarg)) {
+                        fprintf(stderr,
+                                "Invalid ip/port %s for "
+                                "-forward-dropped-tcp2sink. "
+                                "We expect 'sink_ip:sink_port'\n",
+                                optarg);
+                        exit(1);
+                    }
+                    slirp_forward_dropped_tcp2sink(saddr.u.inet.address,
+                                                   saddr.u.inet.port);
+                }
+                break;
+            /* -------------------------------------------------------*/
+
             case QEMU_OPTION_tb_size:
                 tb_size = strtol(optarg, NULL, 0);
                 if (tb_size < 0)
@@ -4508,10 +4831,6 @@ int main(int argc, char **argv, char **envp)
                 op_charmap_file = (char*)optarg;
                 break;
 
-            case QEMU_OPTION_android_gui:
-                android_op_gui = (char*)optarg;
-                break;
-
             case QEMU_OPTION_android_hw:
                 android_op_hwini = (char*)optarg;
                 break;
@@ -4596,26 +4915,16 @@ int main(int argc, char **argv, char **envp)
 #ifdef CONFIG_MEMCHECK
             case QEMU_OPTION_android_memcheck:
                 android_op_memcheck = (char*)optarg;
-                snprintf(tmp_str, sizeof(tmp_str), "memcheck=%s",
-                         android_op_memcheck);
-                tmp_str[sizeof(tmp_str) - 1] = '\0';
                 /* This will set ro.kernel.memcheck system property
                  * to memcheck's tracing flags. */
-                append_param(kernel_cmdline_append, tmp_str, sizeof(kernel_cmdline_append));
+                stralloc_add_format(kernel_config, " memcheck=%s", android_op_memcheck);
                 break;
 #endif // CONFIG_MEMCHECK
-            }
-        }
-    }
 
-    /* Parse GUI option early, so when we init framebuffer in goldfish we have
-     * saved display parameters. */
-    if (android_op_gui) {
-        if (parse_androig_gui_option(android_op_gui,
-                                     &android_display_width,
-                                     &android_display_height,
-                                     &android_display_bpp)) {
-            PANIC("Unable to parse -android-gui parameter: %s", android_op_gui);
+            case QEMU_OPTION_snapshot_no_time_update:
+                android_snapshot_update_time = 0;
+                break;
+            }
         }
     }
 
@@ -4641,20 +4950,36 @@ int main(int argc, char **argv, char **envp)
         data_dir = CONFIG_QEMU_SHAREDIR;
     }
 
-#ifdef CONFIG_STANDALONE_CORE
-    /* Initialize hardware configuration. */
-    if (android_op_hwini) {
-      hw_ini = iniFile_newFromFile(android_op_hwini);
-      if (hw_ini == NULL) {
+    if (!android_op_hwini) {
+        PANIC("Missing -android-hw <file> option!");
+    }
+    hw_ini = iniFile_newFromFile(android_op_hwini);
+    if (hw_ini == NULL) {
         PANIC("Could not find %s file.", android_op_hwini);
-      }
-    } else {
-      hw_ini = iniFile_newFromMemory("", 0);
     }
 
+    androidHwConfig_init(android_hw, 0);
     androidHwConfig_read(android_hw, hw_ini);
+
     iniFile_free(hw_ini);
-#endif  // CONFIG_STANDALONE_CORE
+
+    {
+        int width  = android_hw->hw_lcd_width;
+        int height = android_hw->hw_lcd_height;
+        int depth  = android_hw->hw_lcd_depth;
+
+        /* A bit of sanity checking */
+        if (width <= 0 || height <= 0    ||
+            (depth != 16 && depth != 32) ||
+            (((width|height) & 3) != 0)  )
+        {
+            PANIC("Invalid display configuration (%d,%d,%d)",
+                  width, height, depth);
+        }
+        android_display_width  = width;
+        android_display_height = height;
+        android_display_bpp    = depth;
+    }
 
 #ifdef CONFIG_NAND_LIMITS
     /* Init nand stuff. */
@@ -4662,6 +4987,114 @@ int main(int argc, char **argv, char **envp)
         parse_nand_limits(android_op_nand_limits);
     }
 #endif  // CONFIG_NAND_LIMITS
+
+    /* Initialize AVD name from hardware configuration if needed */
+    if (!android_op_avd_name) {
+        if (android_hw->avd_name && *android_hw->avd_name) {
+            android_op_avd_name = android_hw->avd_name;
+            VERBOSE_PRINT(init,"AVD Name: %s", android_op_avd_name);
+        }
+    }
+
+    /* Initialize system partition image */
+    {
+        char        tmp[PATH_MAX+32];
+        const char* sysImage = android_hw->disk_systemPartition_path;
+        const char* initImage = android_hw->disk_systemPartition_initPath;
+        uint64_t    sysBytes = android_hw->disk_systemPartition_size;
+
+        if (sysBytes == 0) {
+            PANIC("Invalid system partition size: %" PRUd64, sysBytes);
+        }
+
+        snprintf(tmp,sizeof(tmp),"system,size=0x%" PRUx64, sysBytes);
+
+        if (sysImage && *sysImage) {
+            if (filelock_create(sysImage) == NULL) {
+                fprintf(stderr,"WARNING: System image already in use, changes will not persist!\n");
+                /* If there is no file= parameters, nand_add_dev will create
+                 * a temporary file to back the partition image. */
+            } else {
+                pstrcat(tmp,sizeof(tmp),",file=");
+                pstrcat(tmp,sizeof(tmp),sysImage);
+            }
+        }
+        if (initImage && *initImage) {
+            if (!path_exists(initImage)) {
+                PANIC("Invalid initial system image path: %s", initImage);
+            }
+            pstrcat(tmp,sizeof(tmp),",initfile=");
+            pstrcat(tmp,sizeof(tmp),initImage);
+        } else {
+            PANIC("Missing initial system image path!");
+        }
+        nand_add_dev(tmp);
+    }
+
+    /* Initialize data partition image */
+    {
+        char        tmp[PATH_MAX+32];
+        const char* dataImage = android_hw->disk_dataPartition_path;
+        const char* initImage = android_hw->disk_dataPartition_initPath;
+        uint64_t    dataBytes = android_hw->disk_dataPartition_size;
+
+        if (dataBytes == 0) {
+            PANIC("Invalid data partition size: %" PRUd64, dataBytes);
+        }
+
+        snprintf(tmp,sizeof(tmp),"userdata,size=0x%" PRUx64, dataBytes);
+
+        if (dataImage && *dataImage) {
+            if (filelock_create(dataImage) == NULL) {
+                fprintf(stderr, "WARNING: Data partition already in use. Changes will not persist!\n");
+                /* Note: if there is no file= parameters, nand_add_dev() will
+                 *       create a temporary file to back the partition image. */
+            } else {
+                /* Create the file if needed */
+                if (!path_exists(dataImage)) {
+                    if (path_empty_file(dataImage) < 0) {
+                        PANIC("Could not create data image file %s: %s", dataImage, strerror(errno));
+                    }
+                }
+                pstrcat(tmp, sizeof(tmp), ",file=");
+                pstrcat(tmp, sizeof(tmp), dataImage);
+            }
+        }
+        if (initImage && *initImage) {
+            pstrcat(tmp, sizeof(tmp), ",initfile=");
+            pstrcat(tmp, sizeof(tmp), initImage);
+        }
+        nand_add_dev(tmp);
+    }
+
+    /* Init SD-Card stuff. For Android, it is always hda */
+    /* If the -hda option was used, ignore the Android-provided one */
+    if (hda_opts == NULL) {
+        const char* sdPath = android_hw->hw_sdCard_path;
+        if (sdPath && *sdPath) {
+            if (!path_exists(sdPath)) {
+                fprintf(stderr, "WARNING: SD Card image is missing: %s\n", sdPath);
+            } else if (filelock_create(sdPath) == NULL) {
+                fprintf(stderr, "WARNING: SD Card image already in use: %s\n", sdPath);
+            } else {
+                /* Successful locking */
+                hda_opts = drive_add(sdPath, HD_ALIAS, 0);
+            }
+        }
+    }
+
+    if (hdb_opts == NULL) {
+        const char* spath = android_hw->disk_snapStorage_path;
+        if (spath && *spath) {
+            if (!path_exists(spath)) {
+                PANIC("Snapshot storage file does not exist: %s", spath);
+            }
+            if (filelock_create(spath) == NULL) {
+                PANIC("Snapshot storag already in use: %s", spath);
+            }
+            hdb_opts = drive_add(spath, HD_ALIAS, 1);
+        }
+    }
 
     /* Set the VM's max heap size, passed as a boot property */
     if (android_hw->vm_heapSize > 0) {
@@ -4689,11 +5122,10 @@ int main(int argc, char **argv, char **envp)
     }
 
     /* Initialize LCD density */
-    if (android_op_lcd_density) {
-        char*   end;
-        long density = strtol(android_op_lcd_density, &end, 0);
-        if (end == NULL || *end || density < 0) {
-            PANIC("option -lcd-density must be a positive integer");
+    if (android_hw->hw_lcd_density) {
+        long density = android_hw->hw_lcd_density;
+        if (density <= 0) {
+            PANIC("Invalid hw.lcd.density value: %ld", density);
         }
         hwLcd_setBootProperty(density);
     }
@@ -4743,6 +5175,9 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
+    /* Initialize OpenGLES emulation */
+    //android_hw_opengles_init();
+
     if (android_op_cpu_delay) {
         char*   end;
         long    delay = strtol(android_op_cpu_delay, &end, 0);
@@ -4789,8 +5224,7 @@ int main(int argc, char **argv, char **envp)
     if (dns_count == 0)
         dns_count = slirp_get_system_dns_servers();
     if (dns_count) {
-        snprintf(tmp_str, sizeof(tmp_str), "ndns=%d", dns_count);
-        append_param(kernel_cmdline_append, tmp_str, sizeof(kernel_cmdline_append));
+        stralloc_add_format(kernel_config, " ndns=%d", dns_count);
     }
 
 #ifdef CONFIG_MEMCHECK
@@ -4798,6 +5232,46 @@ int main(int argc, char **argv, char **envp)
         memcheck_init(android_op_memcheck);
     }
 #endif  // CONFIG_MEMCHECK
+
+    /* Initialize cache partition, if any */
+    if (android_hw->disk_cachePartition != 0) {
+        char        tmp[PATH_MAX+32];
+        const char* partPath = android_hw->disk_cachePartition_path;
+        uint64_t    partSize = android_hw->disk_cachePartition_size;
+
+        snprintf(tmp,sizeof(tmp),"cache,size=0x%" PRUx64, partSize);
+
+        if (partPath && *partPath && strcmp(partPath, "<temp>") != 0) {
+            if (filelock_create(partPath) == NULL) {
+                fprintf(stderr, "WARNING: Cache partition already in use. Changes will not persist!\n");
+                /* Note: if there is no file= parameters, nand_add_dev() will
+                 *       create a temporary file to back the partition image. */
+            } else {
+                /* Create the file if needed */
+                if (!path_exists(partPath)) {
+                    if (path_empty_file(partPath) < 0) {
+                        PANIC("Could not create cache image file %s: %s", partPath, strerror(errno));
+                    }
+                }
+                pstrcat(tmp, sizeof(tmp), ",file=");
+                pstrcat(tmp, sizeof(tmp), partPath);
+            }
+        }
+        nand_add_dev(tmp);
+    }
+
+    /* We always force qemu=1 when running inside QEMU */
+    stralloc_add_str(kernel_params, " qemu=1");
+
+    /* We always initialize the first serial port for the android-kmsg
+     * character device (used to send kernel messages) */
+    serial_hds_add_at(0, "android-kmsg");
+    stralloc_add_str(kernel_params, " console=ttyS0");
+
+    /* We always initialize the second serial port for the android-qemud
+     * character device as well */
+    serial_hds_add_at(1, "android-qemud");
+    stralloc_add_str(kernel_params, " android.qemud=ttyS1");
 
 #if defined(CONFIG_KVM) && defined(CONFIG_KQEMU)
     if (kvm_allowed && kqemu_allowed) {
@@ -4891,6 +5365,14 @@ int main(int argc, char **argv, char **envp)
     if (qemu_init_main_loop()) {
         PANIC("qemu_init_main_loop failed");
     }
+
+    if (kernel_filename == NULL) {
+        kernel_filename = android_hw->kernel_path;
+    }
+    if (initrd_filename == NULL) {
+        initrd_filename = android_hw->disk_ramdisk_path;
+    }
+
     linux_boot = (kernel_filename != NULL);
     net_boot = (boot_devices_bitmap >> ('n' - 'a')) & 0xF;
 
@@ -4968,8 +5450,12 @@ int main(int argc, char **argv, char **envp)
         }
 
     /* init the memory */
-    if (ram_size == 0)
-        ram_size = DEFAULT_RAM_SIZE * 1024 * 1024;
+    if (ram_size == 0) {
+        ram_size = android_hw->hw_ramSize * 1024LL * 1024;
+        if (ram_size == 0) {
+            ram_size = DEFAULT_RAM_SIZE * 1024 * 1024;
+        }
+    }
 
 #ifdef CONFIG_KQEMU
     /* FIXME: This is a nasty hack because kqemu can't cope with dynamic
@@ -4981,6 +5467,10 @@ int main(int argc, char **argv, char **envp)
             PANIC("Could not allocate physical memory");
         }
     }
+#endif
+
+#ifndef _WIN32
+    init_qemu_clear_logs_sig();
 #endif
 
     /* init the dynamic translator */
@@ -5093,16 +5583,7 @@ int main(int argc, char **argv, char **envp)
     }
 
     for(i = 0; i < MAX_SERIAL_PORTS; i++) {
-        const char *devname = serial_devices[i];
-        if (devname && strcmp(devname, "none")) {
-            char label[32];
-            snprintf(label, sizeof(label), "serial%d", i);
-            serial_hds[i] = qemu_chr_open(label, devname, NULL);
-            if (!serial_hds[i]) {
-                PANIC("qemu: could not open serial device '%s'",
-                        devname);
-            }
-        }
+        serial_hds_add(serial_devices[i]);
     }
 
     for(i = 0; i < MAX_PARALLEL_PORTS; i++) {
@@ -5148,22 +5629,69 @@ int main(int argc, char **argv, char **envp)
     }
 #endif
 
-    /* Combine kernel command line passed from the UI with parameters
-     * collected during initialization. */
-    if (*kernel_cmdline) {
-        if (kernel_cmdline_append[0]) {
-            snprintf(kernel_cmdline_full, sizeof(kernel_cmdline_full), "%s %s",
-                     kernel_cmdline, kernel_cmdline_append);
-        } else {
-            strncpy(kernel_cmdline_full, kernel_cmdline, sizeof(kernel_cmdline_full));
-            kernel_cmdline_full[sizeof(kernel_cmdline_full) - 1] = '\0';
-        }
-    } else if (kernel_cmdline_append[0]) {
-        strncpy(kernel_cmdline_full, kernel_cmdline_append, sizeof(kernel_cmdline_full));
+    /* Check the CPU Architecture value */
+#if defined(TARGET_ARM)
+    if (strcmp(android_hw->hw_cpu_arch,"arm") != 0) {
+        fprintf(stderr, "-- Invalid CPU architecture: %s, expected 'arm'\n",
+                android_hw->hw_cpu_arch);
+        exit(1);
+    }
+#elif defined(TARGET_X86)
+    if (strcmp(android_hw->hw_cpu_arch,"x86") != 0) {
+        fprintf(stderr, "-- Invalid CPU architecture: %s, expected 'x86'\n",
+                android_hw->hw_cpu_arch);
+        exit(1);
+    }
+#endif
+
+    /* Grab CPU model if provided in hardware.ini */
+    if (    !cpu_model
+         && android_hw->hw_cpu_model
+         && android_hw->hw_cpu_model[0] != '\0')
+    {
+        cpu_model = android_hw->hw_cpu_model;
     }
 
-    machine->init(ram_size, boot_devices,
-                  kernel_filename, kernel_cmdline_full, initrd_filename, cpu_model);
+    /* Combine kernel command line passed from the UI with parameters
+     * collected during initialization.
+     *
+     * The order is the following:
+     * - parameters from the hw configuration (kernel.parameters)
+     * - additionnal parameters from options (e.g. -memcheck)
+     * - the -append parameters.
+     */
+    {
+        const char* kernel_parameters;
+
+        if (android_hw->kernel_parameters) {
+            stralloc_add_c(kernel_params, ' ');
+            stralloc_add_str(kernel_params, android_hw->kernel_parameters);
+        }
+
+        /* If not empty, kernel_config always contains a leading space */
+        stralloc_append(kernel_params, kernel_config);
+
+        if (*kernel_cmdline) {
+            stralloc_add_c(kernel_params, ' ');
+            stralloc_add_str(kernel_params, kernel_cmdline);
+        }
+
+        /* Remove any leading/trailing spaces */
+        stralloc_strip(kernel_params);
+
+        kernel_parameters = stralloc_cstr(kernel_params);
+        VERBOSE_PRINT(init, "Kernel parameters: %s", kernel_parameters);
+
+        machine->init(ram_size,
+                      boot_devices,
+                      kernel_filename,
+                      kernel_parameters,
+                      initrd_filename,
+                      cpu_model);
+
+        stralloc_reset(kernel_params);
+        stralloc_reset(kernel_config);
+    }
 
 
     for (env = first_cpu; env != NULL; env = env->next_cpu) {
@@ -5199,16 +5727,11 @@ int main(int argc, char **argv, char **envp)
     /* just use the first displaystate for the moment */
     ds = get_displaystate();
 
-    if (android_op_gui) {
-        /* Initialize display from the command line parameters. */
-        android_display_reset(ds,
-                              android_display_width,
-                              android_display_height,
-                              android_display_bpp);
-    } else {
-        /* By default, use 320x480x16 */
-        android_display_reset(ds, 320, 480, 16);
-    }
+    /* Initialize display from the command line parameters. */
+    android_display_reset(ds,
+                          android_display_width,
+                          android_display_height,
+                          android_display_bpp);
 
     if (display_type == DT_DEFAULT) {
 #if defined(CONFIG_SDL) || defined(CONFIG_COCOA)

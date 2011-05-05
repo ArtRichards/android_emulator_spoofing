@@ -213,22 +213,6 @@ qemulator_get_first_framebuffer(QEmulator* emulator)
     return NULL;
 }
 
-int
-qemulator_get_lcd_width(void)
-{
-    QEmulator*  emulator = qemulator_get();
-    QFrameBuffer*  qfb = qemulator_get_first_framebuffer(emulator);
-    return qfb ? qfb->width : 640;
-}
-
-int
-qemulator_get_lcd_height(void)
-{
-    QEmulator*  emulator = qemulator_get();
-    QFrameBuffer*  qfb = qemulator_get_first_framebuffer(emulator);
-    return qfb ? qfb->height : 480;
-}
-
 void
 qemulator_set_title(QEmulator* emulator)
 {
@@ -274,7 +258,7 @@ qemulator_set_title(QEmulator* emulator)
  * Helper routines
  */
 
-int
+static int
 get_device_dpi( AndroidOptions*  opts )
 {
     int    dpi_device  = corecmd_get_hw_lcd_density();

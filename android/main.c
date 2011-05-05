@@ -38,7 +38,7 @@
 
 #include "android/user-config.h"
 #include "android/utils/bufprint.h"
-#include "android/utils/dirscanner.h"
+#include "android/utils/filelock.h"
 #include "android/utils/path.h"
 #include "android/utils/tempfile.h"
 
@@ -55,11 +55,6 @@
 
 #include "android/framebuffer.h"
 #include "iolooper.h"
-
-#ifdef TARGET_I386
-nand_threshold android_nand_read_threshold;
-nand_threshold android_nand_write_threshold;
-#endif
 
 AndroidRotation  android_framebuffer_rotation;
 
@@ -81,10 +76,6 @@ extern int qemu_milli_needed;
 /* the default device DPI if none is specified by the skin
  */
 #define  DEFAULT_DEVICE_DPI  165
-
-#if 0
-static int  opts->flashkeys;      /* forward */
-#endif
 
 #ifdef CONFIG_TRACE
 extern void  start_tracing(void);
@@ -117,128 +108,21 @@ void emulator_help( void )
     exit(1);
 }
 
-/* this function is used to perform auto-detection of the
- * system directory in the case of a SDK installation.
- *
- * we want to deal with several historical usages, hence
- * the slightly complicated logic.
- *
- * NOTE: the function returns the path to the directory
- *       containing 'fileName'. this is *not* the full
- *       path to 'fileName'.
- */
+/* TODO: Put in shared source file */
 static char*
-_getSdkImagePath( const char*  fileName )
+_getFullFilePath( const char* rootPath, const char* fileName )
 {
-    char   temp[MAX_PATH];
-    char*  p   = temp;
-    char*  end = p + sizeof(temp);
-    char*  q;
-    char*  app;
+    if (path_is_absolute(fileName)) {
+        return ASTRDUP(fileName);
+    } else {
+        char temp[PATH_MAX], *p=temp, *end=p+sizeof(temp);
 
-    static const char* const  searchPaths[] = {
-        "",                                  /* program's directory */
-        "/lib/images",                       /* this is for SDK 1.0 */
-        "/../platforms/android-1.1/images",  /* this is for SDK 1.1 */
-        NULL
-    };
-
-    app = bufprint_app_dir(temp, end);
-    if (app >= end)
-        return NULL;
-
-    do {
-        int  nn;
-
-        /* first search a few well-known paths */
-        for (nn = 0; searchPaths[nn] != NULL; nn++) {
-            p = bufprint(app, end, "%s", searchPaths[nn]);
-            q = bufprint(p, end, "/%s", fileName);
-            if (q < end && path_exists(temp)) {
-                *p = 0;
-                goto FOUND_IT;
-            }
+        p = bufprint(temp, end, "%s/%s", rootPath, fileName);
+        if (p >= end) {
+            return NULL;
         }
-
-        /* hmmm. let's assume that we are in a post-1.1 SDK
-         * scan ../platforms if it exists
-         */
-        p = bufprint(app, end, "/../platforms");
-        if (p < end) {
-            DirScanner*  scanner = dirScanner_new(temp);
-            if (scanner != NULL) {
-                int          found = 0;
-                const char*  subdir;
-
-                for (;;) {
-                    subdir = dirScanner_next(scanner);
-                    if (!subdir) break;
-
-                    q = bufprint(p, end, "/%s/images/%s", subdir, fileName);
-                    if (q >= end || !path_exists(temp))
-                        continue;
-
-                    found = 1;
-                    p = bufprint(p, end, "/%s/images", subdir);
-                    break;
-                }
-                dirScanner_free(scanner);
-                if (found)
-                    break;
-            }
-        }
-
-        /* I'm out of ideas */
-        return NULL;
-
-    } while (0);
-
-FOUND_IT:
-    //D("image auto-detection: %s/%s", temp, fileName);
-    return android_strdup(temp);
-}
-
-static char*
-_getSdkImage( const char*  path, const char*  file )
-{
-    char  temp[MAX_PATH];
-    char  *p = temp, *end = p + sizeof(temp);
-
-    p = bufprint(temp, end, "%s/%s", path, file);
-    if (p >= end || !path_exists(temp))
-        return NULL;
-
-    return android_strdup(temp);
-}
-
-static char*
-_getSdkSystemImage( const char*  path, const char*  optionName, const char*  file )
-{
-    char*  image = _getSdkImage(path, file);
-
-    if (image == NULL) {
-        derror("Your system directory is missing the '%s' image file.\n"
-               "Please specify one with the '%s <filepath>' option",
-               file, optionName);
-        exit(2);
+        return ASTRDUP(temp);
     }
-    return image;
-}
-
-static void
-_forceAvdImagePath( AvdImageType  imageType,
-                   const char*   path,
-                   const char*   description,
-                   int           required )
-{
-    if (path == NULL)
-        return;
-
-    if (required && !path_exists(path)) {
-        derror("Cannot find %s image file: %s", description, path);
-        exit(1);
-    }
-    android_avdParams->forcePaths[imageType] = path;
 }
 
 static uint64_t
@@ -277,29 +161,21 @@ int main(int argc, char **argv)
     char*  args[128];
     int    n;
     char*  opt;
-    int    use_sdcard_img = 0;
-    int    serial = 0;
-    int    gps_serial = 0;
-    int    radio_serial = 0;
-    int    qemud_serial = 0;
+    /* The emulator always uses the first serial port for kernel messages
+     * and the second one for qemud. So start at the third if we need one
+     * for logcat or 'shell'
+     */
+    int    serial = 2;
     int    shell_serial = 0;
-    unsigned  cachePartitionSize = 0;
-    unsigned  systemPartitionSize = 0;
-    unsigned  dataPartitionSize = 0;
-    unsigned  defaultPartitionSize = convertMBToBytes(66);
 
     AndroidHwConfig*  hw;
     AvdInfo*          avd;
     AConfig*          skinConfig;
     char*             skinPath;
-
-    //const char *appdir = get_app_dir();
-    char*       android_build_root = NULL;
-    char*       android_build_out  = NULL;
+    int               inAndroidBuild;
+    uint64_t          defaultPartitionSize = convertMBToBytes(66);
 
     AndroidOptions  opts[1];
-    /* LCD density value to pass to the core. */
-    char lcd_density[16];
     /* net.shared_net_ip boot property value. */
     char boot_prop_ip[64];
     boot_prop_ip[0] = '\0';
@@ -309,6 +185,12 @@ int main(int argc, char **argv)
     if ( android_parse_options( &argc, &argv, opts ) < 0 ) {
         exit(1);
     }
+
+#ifdef _WIN32
+    socket_init();
+#endif
+
+    handle_ui_options(opts);
 
     while (argc-- > 1) {
         opt = (++argv)[0];
@@ -360,7 +242,7 @@ int main(int argc, char **argv)
 
     if (opts->version) {
         printf("Android emulator version %s\n"
-               "Copyright (C) 2006-2008 The Android Open Source Project and many others.\n"
+               "Copyright (C) 2006-2011 The Android Open Source Project and many others.\n"
                "This program is a derivative of the QEMU CPU emulator (www.qemu.org).\n\n",
 #if defined ANDROID_BUILD_ID
                VERSION_STRING " (build_id " STRINGIFY(ANDROID_BUILD_ID) ")" );
@@ -378,255 +260,52 @@ int main(int argc, char **argv)
         exit(0);
     }
 
+    if (opts->snapshot_list) {
+        snapshot_print_and_exit(opts->snapstorage);
+    }
+
+    sanitizeOptions(opts);
+
+    /* Initialization of UI started with -attach-core should work differently
+     * than initialization of UI that starts the core. In particular....
+     */
+
+    /* -charmap is incompatible with -attach-core, because particular
+     * charmap gets set up in the running core. */
     if (android_charmap_setup(opts->charmap)) {
         exit(1);
     }
 
-    /* legacy support: we used to use -system <dir> and -image <file>
-     * instead of -sysdir <dir> and -system <file>, so handle this by checking
-     * whether the options point to directories or files.
-     */
-    if (opts->image != NULL) {
-        if (opts->system != NULL) {
-            if (opts->sysdir != NULL) {
-                derror( "You can't use -sysdir, -system and -image at the same time.\n"
-                        "You should probably use '-sysdir <path> -system <file>'.\n" );
-                exit(2);
-            }
-        }
-        dwarning( "Please note that -image is obsolete and that -system is now used to point\n"
-                  "to the system image. Next time, try using '-sysdir <path> -system <file>' instead.\n" );
-        opts->sysdir = opts->system;
-        opts->system = opts->image;
-        opts->image  = NULL;
-    }
-    else if (opts->system != NULL && path_is_dir(opts->system)) {
-        if (opts->sysdir != NULL) {
-            derror( "Option -system should now be followed by a file path, not a directory one.\n"
-                    "Please use '-sysdir <path>' to point to the system directory.\n" );
-            exit(1);
-        }
-        dwarning( "Please note that the -system option should now be used to point to the initial\n"
-                  "system image (like the obsolete -image option). To point to the system directory\n"
-                  "please now use '-sysdir <path>' instead.\n" );
-
-        opts->sysdir = opts->system;
-        opts->system = NULL;
-    }
-
-    if (opts->nojni)
-        opts->no_jni = opts->nojni;
-
-    if (opts->nocache)
-        opts->no_cache = opts->nocache;
-
-    if (opts->noaudio)
-        opts->no_audio = opts->noaudio;
-
-    if (opts->noskin)
-        opts->no_skin = opts->noskin;
-
-    /* If no AVD name was given, try to find the top of the
-     * Android build tree
-     */
-    if (opts->avd == NULL) {
-        do {
-            char*  out = getenv("ANDROID_PRODUCT_OUT");
-
-            if (out == NULL || out[0] == 0)
-                break;
-
-            if (!path_exists(out)) {
-                derror("Can't access ANDROID_PRODUCT_OUT as '%s'\n"
-                    "You need to build the Android system before launching the emulator",
-                    out);
-                exit(2);
-            }
-
-            android_build_root = path_parent( out, 4 );
-            if (android_build_root == NULL || !path_exists(android_build_root)) {
-                derror("Can't find the Android build root from '%s'\n"
-                    "Please check the definition of the ANDROID_PRODUCT_OUT variable.\n"
-                    "It should point to your product-specific build output directory.\n",
-                    out );
-                exit(2);
-            }
-            android_build_out = out;
-            D( "found Android build root: %s", android_build_root );
-            D( "found Android build out:  %s", android_build_out );
-        } while (0);
-    }
-    /* if no virtual device name is given, and we're not in the
-     * Android build system, we'll need to perform some auto-detection
-     * magic :-)
-     */
-    if (opts->avd == NULL && !android_build_out)
-    {
-        char   dataDirIsSystem = 0;
-
-        if (!opts->sysdir) {
-            opts->sysdir = _getSdkImagePath("system.img");
-            if (!opts->sysdir) {
-                derror(
-                "You did not specify a virtual device name, and the system\n"
-                "directory could not be found.\n\n"
-                "If you are an Android SDK user, please use '@<name>' or '-avd <name>'\n"
-                "to start a given virtual device (see -help-avd for details).\n\n"
-
-                "Otherwise, follow the instructions in -help-disk-images to start the emulator\n"
-                );
-                exit(2);
-            }
-            D("autoconfig: -sysdir %s", opts->sysdir);
-        }
-
-        if (!opts->system) {
-            opts->system = _getSdkSystemImage(opts->sysdir, "-image", "system.img");
-            D("autoconfig: -image %s", opts->image);
-        }
-
-        if (!opts->kernel) {
-            opts->kernel = _getSdkSystemImage(opts->sysdir, "-kernel", "kernel-qemu");
-            D("autoconfig: -kernel %s", opts->kernel);
-        }
-
-        if (!opts->ramdisk) {
-            opts->ramdisk = _getSdkSystemImage(opts->sysdir, "-ramdisk", "ramdisk.img");
-            D("autoconfig: -ramdisk %s", opts->ramdisk);
-        }
-
-        /* if no data directory is specified, use the system directory */
-        if (!opts->datadir) {
-            opts->datadir   = android_strdup(opts->sysdir);
-            dataDirIsSystem = 1;
-            D("autoconfig: -datadir %s", opts->sysdir);
-        }
-
-        if (!opts->data) {
-            /* check for userdata-qemu.img in the data directory */
-            bufprint(tmp, tmpend, "%s/userdata-qemu.img", opts->datadir);
-            if (!path_exists(tmp)) {
-                derror(
-                "You did not provide the name of an Android Virtual Device\n"
-                "with the '-avd <name>' option. Read -help-avd for more information.\n\n"
-
-                "If you *really* want to *NOT* run an AVD, consider using '-data <file>'\n"
-                "to specify a data partition image file (I hope you know what you're doing).\n"
-                );
-                exit(2);
-            }
-
-            opts->data = android_strdup(tmp);
-            D("autoconfig: -data %s", opts->data);
-        }
-
-        if (!opts->sdcard && opts->datadir) {
-            bufprint(tmp, tmpend, "%s/sdcard.img", opts->datadir);
-            if (path_exists(tmp)) {
-                opts->sdcard = android_strdup(tmp);
-                D("autoconfig: -sdcard %s", opts->sdcard);
-            }
-        }
-
-#if CONFIG_ANDROID_SNAPSHOTS
-        if (!opts->snapstorage && opts->datadir) {
-            bufprint(tmp, tmpend, "%s/snapshots.img", opts->datadir);
-            if (path_exists(tmp)) {
-                opts->snapstorage = android_strdup(tmp);
-                D("autoconfig: -snapstorage %s", opts->snapstorage);
-            }
-        }
-#endif // CONFIG_ANDROID_SNAPSHOTS
-    }
-
-    /* setup the virtual device parameters from our options
-     */
-    if (opts->no_cache) {
-        android_avdParams->flags |= AVDINFO_NO_CACHE;
-    }
-    if (opts->wipe_data) {
-        android_avdParams->flags |= AVDINFO_WIPE_DATA | AVDINFO_WIPE_CACHE;
-    }
-#if CONFIG_ANDROID_SNAPSHOTS
-    if (opts->no_snapstorage) {
-        android_avdParams->flags |= AVDINFO_NO_SNAPSHOTS;
-    }
-#endif
-
-    /* if certain options are set, we can force the path of
-        * certain kernel/disk image files
-        */
-    _forceAvdImagePath(AVD_IMAGE_KERNEL,     opts->kernel,      "kernel", 1);
-    _forceAvdImagePath(AVD_IMAGE_INITSYSTEM, opts->system,      "system", 1);
-    _forceAvdImagePath(AVD_IMAGE_RAMDISK,    opts->ramdisk,     "ramdisk", 1);
-    _forceAvdImagePath(AVD_IMAGE_USERDATA,   opts->data,        "user data", 0);
-    _forceAvdImagePath(AVD_IMAGE_CACHE,      opts->cache,       "cache", 0);
-    _forceAvdImagePath(AVD_IMAGE_SDCARD,     opts->sdcard,      "SD Card", 0);
-#if CONFIG_ANDROID_SNAPSHOTS
-    _forceAvdImagePath(AVD_IMAGE_SNAPSHOTS,  opts->snapstorage, "snapshots", 0);
-#endif
-
-    /* we don't accept -skindir without -skin now
-     * to simplify the autoconfig stuff with virtual devices
-     */
-    if (opts->no_skin) {
-        opts->skin    = "320x480";
-        opts->skindir = NULL;
-    }
-
-    if (opts->skindir) {
-        if (!opts->skin) {
-            derror( "the -skindir <path> option requires a -skin <name> option");
-            exit(1);
-        }
-    }
-    android_avdParams->skinName     = opts->skin;
-    android_avdParams->skinRootPath = opts->skindir;
-
-    /* setup the virtual device differently depending on whether
-     * we are in the Android build system or not
-     */
-    if (opts->avd != NULL)
-    {
-        android_avdInfo = avdInfo_new( opts->avd, android_avdParams );
-        if (android_avdInfo == NULL) {
-            /* an error message has already been printed */
-            dprint("could not find virtual device named '%s'", opts->avd);
-            exit(1);
-        }
-    }
-    else
-    {
-        if (!android_build_out) {
-            android_build_out = android_build_root = opts->sysdir;
-        }
-        android_avdInfo = avdInfo_newForAndroidBuild(
-                            android_build_root,
-                            android_build_out,
-                            android_avdParams );
-
-        if(android_avdInfo == NULL) {
-            D("could not start virtual device\n");
-            exit(1);
-        }
-    }
-
-    avd = android_avdInfo;
+    /* Parses options and builds an appropriate AVD. */
+    avd = android_avdInfo = createAVD(opts, &inAndroidBuild);
 
     /* get the skin from the virtual device configuration */
-    opts->skin    = (char*) avdInfo_getSkinName( avd );
-    opts->skindir = (char*) avdInfo_getSkinDir( avd );
+    if (opts->skindir != NULL) {
+        if (opts->skin == NULL) {
+            /* NOTE: Normally handled by sanitizeOptions(), just be safe */
+            derror("The -skindir <path> option requires a -skin <name> option");
+            exit(2);
+        }
+    } else {
+        char* skinName;
+        char* skinDir;
 
-    if (opts->skin) {
-        D("autoconfig: -skin %s", opts->skin);
-    }
-    if (opts->skindir) {
+        avdInfo_getSkinInfo(avd, &skinName, &skinDir);
+
+        if (opts->skin == NULL) {
+            opts->skin = skinName;
+            D("autoconfig: -skin %s", opts->skin);
+        } else {
+            AFREE(skinName);
+        }
+
+        opts->skindir = skinDir;
         D("autoconfig: -skindir %s", opts->skindir);
     }
 
     /* Read hardware configuration */
     hw = android_hw;
-    if (avdInfo_getHwConfig(avd, hw) < 0) {
+    if (avdInfo_initHwConfig(avd, hw) < 0) {
         derror("could not read hardware configuration ?");
         exit(1);
     }
@@ -667,18 +346,20 @@ int main(int argc, char **argv)
 
 
     user_config_init();
-    parse_skin_files(opts->skindir, opts->skin, opts,
+    parse_skin_files(opts->skindir, opts->skin, opts, hw,
                      &skinConfig, &skinPath);
 
-    if (!opts->netspeed) {
-        if (skin_network_speed)
-            D("skin network speed: '%s'", skin_network_speed);
-        opts->netspeed = (char*)skin_network_speed;
+    if (!opts->netspeed && skin_network_speed) {
+        D("skin network speed: '%s'", skin_network_speed);
+        if (strcmp(skin_network_speed, NETWORK_SPEED_DEFAULT) != 0) {
+            opts->netspeed = (char*)skin_network_speed;
+        }
     }
-    if (!opts->netdelay) {
-        if (skin_network_delay)
-            D("skin network delay: '%s'", skin_network_delay);
-        opts->netdelay = (char*)skin_network_delay;
+    if (!opts->netdelay && skin_network_delay) {
+        D("skin network delay: '%s'", skin_network_delay);
+        if (strcmp(skin_network_delay, NETWORK_DELAY_DEFAULT) != 0) {
+            opts->netdelay = (char*)skin_network_delay;
+        }
     }
 
     if (opts->trace) {
@@ -697,17 +378,26 @@ int main(int argc, char **argv)
         opts->trace = tracePath;
     }
 
-    if (opts->no_cache)
-        opts->cache = 0;
-
     n = 1;
     /* generate arguments for the underlying qemu main() */
     {
-        const char*  kernelFile    = avdInfo_getImageFile(avd, AVD_IMAGE_KERNEL);
-        int          kernelFileLen = strlen(kernelFile);
+        char*  kernelFile    = opts->kernel;
+        int    kernelFileLen;
 
-        args[n++] = "-kernel";
-        args[n++] = (char*)kernelFile;
+        if (kernelFile == NULL) {
+            kernelFile = avdInfo_getKernelPath(avd);
+            if (kernelFile == NULL) {
+                derror( "This AVD's configuration is missing a kernel file!!" );
+                exit(2);
+            }
+            D("autoconfig: -kernel %s", kernelFile);
+        }
+        if (!path_exists(kernelFile)) {
+            derror( "Invalid or missing kernel image file: %s", kernelFile );
+            exit(2);
+        }
+
+        hw->kernel_path = kernelFile;
 
         /* If the kernel image name ends in "-armv7", then change the cpu
          * type automatically. This is a poor man's approach to configuration
@@ -722,6 +412,7 @@ int main(int argc, char **argv)
          * some build system changes. I prefer not to do that for now for reasons
          * of simplicity.
          */
+         kernelFileLen = strlen(kernelFile);
          if (kernelFileLen > 6 && !memcmp(kernelFile + kernelFileLen - 6, "-armv7", 6)) {
             args[n++] = "-cpu";
             args[n++] = "cortex-a8";
@@ -762,11 +453,6 @@ int main(int argc, char **argv)
         args[n++] = "-netfast";
     }
 
-    /* the purpose of -no-audio is to disable sound output from the emulator,
-     * not to disable Audio emulation. So simply force the 'none' backends */
-    if (opts->no_audio)
-        opts->audio = "none";
-
     if (opts->audio) {
         args[n++] = "-audio";
         args[n++] = opts->audio;
@@ -782,9 +468,12 @@ int main(int argc, char **argv)
         args[n++] = opts->dns_server;
     }
 
-    args[n++] = "-initrd";
-    args[n++] = (char*) avdInfo_getImageFile(avd, AVD_IMAGE_RAMDISK);
+    hw->disk_ramdisk_path = avdInfo_getRamdiskPath(avd);
+    D("autoconfig: -ramdisk %s", hw->disk_ramdisk_path);
 
+    /* -partition-size is used to specify the max size of both the system
+     * and data partition sizes.
+     */
     if (opts->partition_size) {
         char*  end;
         long   sizeMB = strtol(opts->partition_size, &end, 0);
@@ -800,105 +489,233 @@ int main(int argc, char **argv)
                     sizeMB, minSizeMB, maxSizeMB );
             exit(1);
         }
-        defaultPartitionSize = sizeMB * ONE_MB;
+        defaultPartitionSize = (uint64_t) sizeMB * ONE_MB;
     }
 
-    /* Check the size of the system partition image.
-     * If we have an AVD, it must be smaller than
-     * the disk.systemPartition.size hardware property.
-     *
-     * Otherwise, we need to adjust the systemPartitionSize
-     * automatically, and print a warning.
-     *
-     */
-    {
-        uint64_t   systemBytes  = avdInfo_getImageFileSize(avd, AVD_IMAGE_INITSYSTEM);
-        uint64_t   defaultBytes = defaultPartitionSize;
 
-        if (defaultBytes == 0 || opts->partition_size)
-            defaultBytes = defaultPartitionSize;
+    /** SYSTEM PARTITION **/
 
-        systemPartitionSize = _adjustPartitionSize("system", systemBytes, defaultBytes,
-                                                   android_build_out != NULL);
+    if (opts->sysdir == NULL) {
+        if (avdInfo_inAndroidBuild(avd)) {
+            opts->sysdir = ASTRDUP(avdInfo_getContentPath(avd));
+            D("autoconfig: -sysdir %s", opts->sysdir);
+        }
     }
 
-    /* Check the size of the /data partition. The only interesting cases here are:
-     * - when the USERDATA image already exists and is larger than the default
-     * - when we're wiping data and the INITDATA is larger than the default.
-     */
+    if (opts->sysdir != NULL) {
+        if (!path_exists(opts->sysdir)) {
+            derror("Directory does not exist: %s", opts->sysdir);
+            exit(1);
+        }
+    }
 
     {
-        const char*  dataPath     = avdInfo_getImageFile(avd, AVD_IMAGE_USERDATA);
+        char*  rwImage   = NULL;
+        char*  initImage = NULL;
+
+        do {
+            if (opts->system == NULL) {
+                /* If -system is not used, try to find a runtime system image
+                * (i.e. system-qemu.img) in the content directory.
+                */
+                rwImage = avdInfo_getSystemImagePath(avd);
+                if (rwImage != NULL) {
+                    break;
+                }
+                /* Otherwise, try to find the initial system image */
+                initImage = avdInfo_getSystemInitImagePath(avd);
+                if (initImage == NULL) {
+                    derror("No initial system image for this configuration!");
+                    exit(1);
+                }
+                break;
+            }
+
+            /* If -system <name> is used, use it to find the initial image */
+            if (opts->sysdir != NULL) {
+                initImage = _getFullFilePath(opts->sysdir, opts->system);
+            } else {
+                initImage = ASTRDUP(opts->system);
+            }
+            if (!path_exists(initImage)) {
+                derror("System image file doesn't exist: %s", initImage);
+                exit(1);
+            }
+
+        } while (0);
+
+        if (rwImage != NULL) {
+            /* Use the read/write image file directly */
+            hw->disk_systemPartition_path     = rwImage;
+            hw->disk_systemPartition_initPath = NULL;
+            D("Using direct system image: %s", rwImage);
+        } else if (initImage != NULL) {
+            hw->disk_systemPartition_path = NULL;
+            hw->disk_systemPartition_initPath = initImage;
+            D("Using initial system image: %s", initImage);
+        }
+
+        /* Check the size of the system partition image.
+        * If we have an AVD, it must be smaller than
+        * the disk.systemPartition.size hardware property.
+        *
+        * Otherwise, we need to adjust the systemPartitionSize
+        * automatically, and print a warning.
+        *
+        */
+        const char* systemImage = hw->disk_systemPartition_path;
+        uint64_t    systemBytes;
+
+        if (systemImage == NULL)
+            systemImage = hw->disk_systemPartition_initPath;
+
+        if (path_get_size(systemImage, &systemBytes) < 0) {
+            derror("Missing system image: %s", systemImage);
+            exit(1);
+        }
+
+        hw->disk_systemPartition_size =
+            _adjustPartitionSize("system", systemBytes, defaultPartitionSize,
+                                 avdInfo_inAndroidBuild(avd));
+    }
+
+    /** DATA PARTITION **/
+
+    if (opts->datadir) {
+        if (!path_exists(opts->datadir)) {
+            derror("Invalid -datadir directory: %s", opts->datadir);
+        }
+    }
+
+    {
+        char*  dataImage = NULL;
+        char*  initImage = NULL;
+
+        do {
+            if (!opts->data) {
+                dataImage = avdInfo_getDataImagePath(avd);
+                if (dataImage != NULL) {
+                    D("autoconfig: -data %s", dataImage);
+                    break;
+                }
+                dataImage = avdInfo_getDefaultDataImagePath(avd);
+                if (dataImage == NULL) {
+                    derror("No data image path for this configuration!");
+                    exit (1);
+                }
+                opts->wipe_data = 1;
+                break;
+            }
+
+            if (opts->datadir) {
+                dataImage = _getFullFilePath(opts->datadir, opts->data);
+            } else {
+                dataImage = ASTRDUP(opts->data);
+            }
+        } while (0);
+
+        if (opts->initdata != NULL) {
+            initImage = ASTRDUP(opts->initdata);
+            if (!path_exists(initImage)) {
+                derror("Invalid initial data image path: %s", initImage);
+                exit(1);
+            }
+        } else {
+            initImage = avdInfo_getDataInitImagePath(avd);
+            D("autoconfig: -initdata %s", initImage);
+        }
+
+        hw->disk_dataPartition_path = dataImage;
+        if (opts->wipe_data) {
+            hw->disk_dataPartition_initPath = initImage;
+        } else {
+            hw->disk_dataPartition_initPath = NULL;
+        }
+
         uint64_t     defaultBytes = defaultPartitionSize;
+        uint64_t     dataBytes;
+        const char*  dataPath = hw->disk_dataPartition_initPath;
 
-        if (defaultBytes == 0 || opts->partition_size)
-            defaultBytes = defaultPartitionSize;
+        if (dataPath == NULL)
+            dataPath = hw->disk_dataPartition_path;
 
-        if (dataPath == NULL || !path_exists(dataPath) || opts->wipe_data) {
-            dataPath = avdInfo_getImageFile(avd, AVD_IMAGE_INITDATA);
-        }
-        if (dataPath == NULL || !path_exists(dataPath)) {
-            dataPartitionSize = defaultBytes;
-        }
-        else {
-            uint64_t  dataBytes;
-            path_get_size(dataPath, &dataBytes);
+        path_get_size(dataPath, &dataBytes);
 
-            dataPartitionSize = _adjustPartitionSize("data", dataBytes, defaultBytes,
-                                                     android_build_out != NULL);
-        }
+        hw->disk_dataPartition_size =
+            _adjustPartitionSize("data", dataBytes, defaultBytes,
+                                 avdInfo_inAndroidBuild(avd));
     }
 
+    /** CACHE PARTITION **/
+
+    if (opts->no_cache) {
+        /* No cache partition at all */
+        hw->disk_cachePartition = 0;
+    }
+    else if (!hw->disk_cachePartition) {
+        if (opts->cache) {
+            dwarning( "Emulated hardware doesn't support a cache partition. -cache option ignored!" );
+            opts->cache = NULL;
+        }
+    }
+    else
     {
-        const char*  filetype = "file";
+        if (!opts->cache) {
+            /* Find the current cache partition file */
+            opts->cache = avdInfo_getCachePath(avd);
+            if (opts->cache == NULL) {
+                /* The file does not exists, we will force its creation
+                 * if we are not in the Android build system. Otherwise,
+                 * a temporary file will be used.
+                 */
+                if (!avdInfo_inAndroidBuild(avd)) {
+                    opts->cache = avdInfo_getDefaultCachePath(avd);
+                }
+            }
+            if (opts->cache) {
+                D("autoconfig: -cache %s", opts->cache);
+            }
+        }
 
-        if (avdInfo_isImageReadOnly(avd, AVD_IMAGE_INITSYSTEM))
-            filetype = "initfile";
-
-        bufprint(tmp, tmpend,
-             "system,size=0x%x,%s=%s", systemPartitionSize, filetype,
-             avdInfo_getImageFile(avd, AVD_IMAGE_INITSYSTEM));
-
-        args[n++] = "-nand";
-        args[n++] = strdup(tmp);
+        if (opts->cache) {
+            hw->disk_cachePartition_path = ASTRDUP(opts->cache);
+        }
     }
 
-    bufprint(tmp, tmpend,
-             "userdata,size=0x%x,file=%s",
-             dataPartitionSize,
-             avdInfo_getImageFile(avd, AVD_IMAGE_USERDATA));
+    /** SD CARD PARTITION */
 
-    args[n++] = "-nand";
-    args[n++] = strdup(tmp);
+    if (!hw->hw_sdCard) {
+        /* No SD Card emulation, so -sdcard will be ignored */
+        if (opts->sdcard) {
+            dwarning( "Emulated hardware doesn't support SD Cards. -sdcard option ignored." );
+            opts->sdcard = NULL;
+        }
+    } else {
+        /* Auto-configure -sdcard if it is not available */
+        if (!opts->sdcard) {
+            do {
+                /* If -datadir <path> is used, look for a sdcard.img file here */
+                if (opts->datadir) {
+                    bufprint(tmp, tmpend, "%s/%s", opts->datadir, "system.img");
+                    if (path_exists(tmp)) {
+                        opts->sdcard = strdup(tmp);
+                        break;
+                    }
+                }
 
-    if (hw->disk_cachePartition) {
-        opts->cache = (char*) avdInfo_getImageFile(avd, AVD_IMAGE_CACHE);
-        cachePartitionSize = hw->disk_cachePartition_size;
-    }
-    else if (opts->cache) {
-        dwarning( "Emulated hardware doesn't support a cache partition" );
-        opts->cache    = NULL;
-        opts->no_cache = 1;
-    }
+                /* Otherwise, look at the AVD's content */
+                opts->sdcard = avdInfo_getSdCardPath(avd);
+                if (opts->sdcard != NULL) {
+                    break;
+                }
 
-    if (opts->cache) {
-        /* use a specific cache file */
-        sprintf(tmp, "cache,size=0x%0x,file=%s", cachePartitionSize, opts->cache);
-        args[n++] = "-nand";
-        args[n++] = strdup(tmp);
-    }
-    else if (!opts->no_cache) {
-        /* create a temporary cache partition file */
-        sprintf(tmp, "cache,size=0x%0x", cachePartitionSize);
-        args[n++] = "-nand";
-        args[n++] = strdup(tmp);
-    }
+                /* Nothing */
+            } while (0);
 
-    if (hw->hw_sdCard != 0)
-        opts->sdcard = (char*) avdInfo_getImageFile(avd, AVD_IMAGE_SDCARD);
-    else if (opts->sdcard) {
-        dwarning( "Emulated hardware doesn't support SD Cards" );
-        opts->sdcard = NULL;
+            if (opts->sdcard) {
+                D("autoconfig: -sdcard %s", opts->sdcard);
+            }
+        }
     }
 
     if(opts->sdcard) {
@@ -911,57 +728,92 @@ int main(int argc, char **argv)
             if (size < 9*1024*1024ULL) {
                 fprintf(stderr, "### WARNING: SD Card files must be at least 9MB, ignoring '%s'\n", opts->sdcard);
             } else {
-                args[n++] = "-hda";
-                args[n++] = opts->sdcard;
-                use_sdcard_img = 1;
+                hw->hw_sdCard_path = ASTRDUP(opts->sdcard);
             }
         } else {
-            D("no SD Card image at '%s'", opts->sdcard);
+            dwarning("no SD Card image at '%s'", opts->sdcard);
         }
     }
 
-#if CONFIG_ANDROID_SNAPSHOTS
-    if (!opts->no_snapstorage) {
-        opts->snapstorage = (char*) avdInfo_getImageFile(avd, AVD_IMAGE_SNAPSHOTS);
-        if(opts->snapstorage) {
-            if (path_exists(opts->snapstorage)) {
-                args[n++] = "-hdb";
-                args[n++] = opts->snapstorage;
-            } else {
-                D("no image at '%s', state snapshots disabled", opts->snapstorage);
+
+    /** SNAPSHOT STORAGE HANDLING */
+
+    /* Determine snapstorage path. -no-snapstorage disables all snapshotting
+     * support. This means you can't resume a snapshot at load, save it at
+     * exit, or even load/save them dynamically at runtime with the console.
+     */
+    if (opts->no_snapstorage) {
+
+        if (opts->snapshot) {
+            dwarning("ignoring -snapshot option due to the use of -no-snapstorage");
+            opts->snapshot = NULL;
+        }
+
+        if (opts->snapstorage) {
+            dwarning("ignoring -snapstorage option due to the use of -no-snapstorage");
+            opts->snapstorage = NULL;
+        }
+    }
+    else
+    {
+        if (!opts->snapstorage) {
+            opts->snapstorage = avdInfo_getSnapStoragePath(avd);
+            if (opts->snapstorage != NULL) {
+                D("autoconfig: -snapstorage %s", opts->snapstorage);
             }
         }
 
-        if (!opts->no_snapshot) {
-            char* snapshot_name =
-                opts->snapshot ? opts->snapshot : "default-boot";
-            if (!opts->no_snapshot_load) {
-              args[n++] = "-loadvm";
-              args[n++] = snapshot_name;
-            }
-            if (!opts->no_snapshot_save) {
-              args[n++] = "-savevm-on-exit";
-              args[n++] = snapshot_name;
-            }
-        } else if (opts->snapshot) {
-            dwarning("option '-no-snapshot' overrides '-snapshot', continuing with boot sequence");
-        } else if (opts->no_snapshot_load || opts->no_snapshot_save) {
-            D("ignoring redundant option(s) '-no-snapshot-load' and/or '-no-snapshot-save' implied by '-no-snapshot'");
+        if (opts->snapstorage && !path_exists(opts->snapstorage)) {
+            D("no image at '%s', state snapshots disabled", opts->snapstorage);
+            opts->snapstorage = NULL;
         }
+    }
+
+    /* If we have a valid snapshot storage path */
+
+    if (opts->snapstorage) {
+
+        hw->disk_snapStorage_path = ASTRDUP(opts->snapstorage);
+
+        /* -no-snapshot is equivalent to using both -no-snapshot-load
+        * and -no-snapshot-save. You can still load/save snapshots dynamically
+        * from the console though.
+        */
+        if (opts->no_snapshot) {
+
+            opts->no_snapshot_load = 1;
+            opts->no_snapshot_save = 1;
+
+            if (opts->snapshot) {
+                dwarning("ignoring -snapshot option due to the use of -no-snapshot.");
+            }
+        }
+
+        if (!opts->no_snapshot_load || !opts->no_snapshot_save) {
+            if (opts->snapshot == NULL) {
+                opts->snapshot = "default-boot";
+                D("autoconfig: -snapshot %s", opts->snapshot);
+            }
+        }
+
+        /* We still use QEMU command-line options for the following since
+        * they can change from one invokation to the next and don't really
+        * correspond to the hardware configuration itself.
+        */
+        if (!opts->no_snapshot_load) {
+            args[n++] = "-loadvm";
+            args[n++] = ASTRDUP(opts->snapshot);
+        }
+
+        if (!opts->no_snapshot_save) {
+            args[n++] = "-savevm-on-exit";
+            args[n++] = ASTRDUP(opts->snapshot);
+        }
+
         if (opts->no_snapshot_update_time) {
-            android_snapshot_update_time = 0;
+            args[n++] = "-snapshot-no-time-update";
         }
-    } else if (opts->snapshot || opts->snapstorage) {
-        dwarning("option '-no-snapstorage' overrides '-snapshot' and '-snapstorage', "
-                 "continuing with full boot, state snapshots are disabled");
-    } else if (opts->no_snapshot) {
-        D("ignoring redundant option '-no-snapshot' implied by '-no-snapstorage'");
     }
-
-    if (opts->snapshot_list) {
-        snapshot_print_and_exit(opts->snapstorage);
-    }
-#endif // CONFIG_ANDROID_SNAPSHOTS
 
     if (!opts->logcat || opts->logcat[0] == 0) {
         opts->logcat = getenv("ANDROID_LOG_TAGS");
@@ -969,22 +821,9 @@ int main(int argc, char **argv)
             opts->logcat = NULL;
     }
 
-#if 0
-    if (opts->console) {
-        derror( "option -console is obsolete. please use -shell instead" );
-        exit(1);
-    }
-#endif
-
     /* we always send the kernel messages from ttyS0 to android_kmsg */
-    {
-        if (opts->show_kernel) {
-            args[n++] = "-show-kernel";
-        }
-
-        args[n++] = "-serial";
-        args[n++] = "android-kmsg";
-        serial++;
+    if (opts->show_kernel) {
+        args[n++] = "-show-kernel";
     }
 
     /* XXXX: TODO: implement -shell and -logcat through qemud instead */
@@ -1004,39 +843,14 @@ int main(int argc, char **argv)
         shell_serial = serial++;
     }
 
-    if (opts->old_system)
-    {
-        if (opts->radio) {
-            args[n++] = "-serial";
-            args[n++] = opts->radio;
-            radio_serial = serial++;
-        }
-        else {
-            args[n++] = "-serial";
-            args[n++] = "android-modem";
-            radio_serial = serial++;
-        }
-        if (opts->gps) {
-            args[n++] = "-serial";
-            args[n++] = opts->gps;
-            gps_serial = serial++;
-        }
+    if (opts->radio) {
+        args[n++] = "-radio";
+        args[n++] = opts->radio;
     }
-    else /* !opts->old_system */
-    {
-        args[n++] = "-serial";
-        args[n++] = "android-qemud";
-        qemud_serial = serial++;
 
-        if (opts->radio) {
-            args[n++] = "-radio";
-            args[n++] = opts->radio;
-        }
-
-        if (opts->gps) {
-            args[n++] = "-gps";
-            args[n++] = opts->gps;
-        }
+    if (opts->gps) {
+        args[n++] = "-gps";
+        args[n++] = opts->gps;
     }
 
     if (opts->memory) {
@@ -1050,6 +864,7 @@ int main(int argc, char **argv)
             derror( "physical memory size must be between 32 and 4096 MB" );
             exit(1);
         }
+        hw->hw_ramSize = ramSize;
     }
     if (!opts->memory) {
         int ramSize = hw->hw_ramSize;
@@ -1059,8 +874,7 @@ int main(int argc, char **argv)
              * size through its hardware.ini (i.e. legacy ones) or when
              * in the full Android build system.
              */
-            int64_t pixels  = get_screen_pixels(skinConfig);
-
+            int64_t pixels  = hw->hw_lcd_width * hw->hw_lcd_height;
             /* The following thresholds are a bit liberal, but we
              * essentially want to ensure the following mappings:
              *
@@ -1078,8 +892,30 @@ int main(int argc, char **argv)
             else
                 ramSize = 256;
         }
-        bufprint(tmp, tmpend, "%d", ramSize);
-        opts->memory = android_strdup(tmp);
+        hw->hw_ramSize = ramSize;
+    }
+
+    D("Physical RAM size: %dMB\n", hw->hw_ramSize);
+
+    if (hw->vm_heapSize == 0) {
+        /* Compute the default heap size based on the RAM size.
+         * Essentially, we want to ensure the following liberal mappings:
+         *
+         *   96MB RAM -> 16MB heap
+         *  128MB RAM -> 24MB heap
+         *  256MB RAM -> 48MB heap
+         */
+        int  ramSize = hw->hw_ramSize;
+        int  heapSize;
+
+        if (ramSize < 100)
+            heapSize = 16;
+        else if (ramSize < 192)
+            heapSize = 24;
+        else
+            heapSize = 48;
+
+        hw->vm_heapSize = heapSize;
     }
 
     if (opts->trace) {
@@ -1088,11 +924,6 @@ int main(int argc, char **argv)
         args[n++] = "-tracing";
         args[n++] = "off";
     }
-
-    /* Pass LCD density value to the core. */
-    snprintf(lcd_density, sizeof(lcd_density), "%d", get_device_dpi(opts));
-    args[n++] = "-lcd-density";
-    args[n++] = lcd_density;
 
     /* Pass boot properties to the core. */
     if (opts->prop != NULL) {
@@ -1103,27 +934,15 @@ int main(int argc, char **argv)
         }
     }
 
-    args[n++] = "-append";
-
-    if (opts->bootchart) {
-        char*  end;
-        int    timeout = strtol(opts->bootchart, &end, 10);
-        if (timeout == 0)
-            opts->bootchart = NULL;
-        else if (timeout < 0 || timeout > 15*60) {
-            derror( "timeout specified for -bootchart option is invalid.\n"
-                    "please use integers between 1 and 900\n");
-            exit(1);
-        }
-    }
-
     /* Setup the kernel init options
      */
     {
         static char  params[1024];
         char        *p = params, *end = p + sizeof(params);
 
-        p = bufprint(p, end, "qemu=1 console=ttyS0" );
+        /* Don't worry about having a leading space here, this is handled
+         * by the core later. */
+
 #ifdef TARGET_I386
         p = bufprint(p, end, " androidboot.hardware=goldfish");
         p = bufprint(p, end, " clocksource=pit");
@@ -1161,19 +980,6 @@ int main(int argc, char **argv)
             p = q;
         }
 
-        if (opts->old_system)
-        {
-            p = bufprint(p, end, " android.ril=ttyS%d", radio_serial);
-
-            if (opts->gps) {
-                p = bufprint(p, end, " android.gps=ttyS%d", gps_serial);
-            }
-        }
-        else
-        {
-            p = bufprint(p, end, " android.qemud=ttyS%d", qemud_serial);
-        }
-
         if (opts->bootchart) {
             p = bufprint(p, end, " androidboot.bootchart=%s", opts->bootchart);
         }
@@ -1183,7 +989,7 @@ int main(int argc, char **argv)
             exit(1);
         }
 
-        args[n++] = strdup(params);
+        hw->kernel_parameters = strdup(params);
     }
 
     if (opts->ports) {
@@ -1216,21 +1022,9 @@ int main(int argc, char **argv)
         args[n++] = opts->memcheck;
     }
 
-    /* physical memory */
-    args[n++] = "-m";
-    args[n++] = opts->memory;
+    /* physical memory is now in hw->hw_ramSize */
 
-    /* on Linux, the 'dynticks' clock sometimes doesn't work
-     * properly. this results in the UI freezing while emulation
-     * continues, for several seconds...
-     */
-#ifdef __linux__
-    args[n++] = "-clock";
-    args[n++] = "unix";
-#endif
-
-    args[n++] = "-android-avdname";
-    args[n++] = avdInfo_getName(avd);
+    hw->avd_name = ASTRDUP(avdInfo_getName(avd));
 
     /* Set up the interfaces for inter-emulator networking */
     if (opts->shared_net_id) {
@@ -1254,29 +1048,32 @@ int main(int argc, char **argv)
     }
     args[n] = 0;
 
-    /* Generate a temporary hardware.ini for this AVD. The real hardware
+    /* Generate a hardware-qemu.ini for this AVD. The real hardware
      * configuration is ususally stored in several files, e.g. the AVD's
      * config.ini plus the skin-specific hardware.ini.
      *
-     * The new temp file will group all definitions and will be used to
+     * The new file will group all definitions and will be used to
      * launch the core with the -android-hw <file> option.
      */
     {
-        TempFile*  tempHw = tempfile_create();
-        if (tempHw == NULL) {
-            derror("Could not create temporary hardware.ini: %s", strerror(errno));
-            exit(2);
+        const char* coreHwIniPath = avdInfo_getCoreHwIniPath(avd);
+        IniFile*    hwIni         = iniFile_newFromMemory("", NULL);
+        androidHwConfig_write(hw, hwIni);
+
+        if (filelock_create(coreHwIniPath) == NULL) {
+            /* The AVD is already in use, we still support this as an
+             * experimental feature. Use a temporary hardware-qemu.ini
+             * file though to avoid overwriting the existing one. */
+             TempFile*  tempIni = tempfile_create();
+             coreHwIniPath = tempfile_path(tempIni);
         }
 
-        const char* tempHwPath = tempfile_path(tempHw);
-        IniFile*    hwIni      = iniFile_newFromMemory("", NULL);
-        androidHwConfig_write(hw, hwIni);
-        if (iniFile_saveToFile(hwIni, tempHwPath) < 0) {
-            derror("Could not write temporary hardware.ini: %s", tempHwPath);
+        if (iniFile_saveToFile(hwIni, coreHwIniPath) < 0) {
+            derror("Could not write hardware.ini to %s: %s", coreHwIniPath, strerror(errno));
             exit(2);
         }
         args[n++] = "-android-hw";
-        args[n++] = strdup(tempHwPath);
+        args[n++] = strdup(coreHwIniPath);
     }
 
     if(VERBOSE_CHECK(init)) {
@@ -1288,7 +1085,14 @@ int main(int argc, char **argv)
         /* Dump final command-line option to make debugging the core easier */
         printf("Concatenated QEMU options:\n");
         for (i = 0; i < n; i++) {
-            printf(" %s", args[i]);
+            /* To make it easier to copy-paste the output to a command-line,
+             * quote anything that contains spaces.
+             */
+            if (strchr(args[i], ' ') != NULL) {
+                printf(" '%s'", args[i]);
+            } else {
+                printf(" %s", args[i]);
+            }
         }
         printf("\n");
     }
@@ -1296,21 +1100,10 @@ int main(int argc, char **argv)
     /* Setup SDL UI just before calling the code */
     init_sdl_ui(skinConfig, skinPath, opts);
 
-    /* HACK: Do not merge this back to master, the following should
-     *        only be used for the tools_r11 emulator binary.
-     */
-#ifndef CONFIG_STANDALONE_CORE
-    {
-        char temp[64];
-
-        snprintf(temp, sizeof temp, "width=%d,height=%d,bpp=16",
-                qemulator_get_lcd_width(),
-                qemulator_get_lcd_height());
-
-        args[n++] = "-android-gui";
-        args[n++] = strdup(temp);
+    if (attach_ui_to_core(opts) < 0) {
+        derror("Can't attach to core!");
+        exit(1);
     }
-#endif
 
     return qemu_main(n, args);
 }

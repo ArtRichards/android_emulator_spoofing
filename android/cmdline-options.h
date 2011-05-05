@@ -75,7 +75,6 @@ CFG_PARAM( cache,    "<file>", "cache partition image (default is temporary file
 CFG_FLAG ( no_cache, "disable the cache partition" )
 CFG_FLAG ( nocache,  "same as -no-cache" )
 OPT_PARAM( sdcard, "<file>", "SD card image (default <system>/sdcard.img")
-#if CONFIG_ANDROID_SNAPSHOTS
 OPT_PARAM( snapstorage,    "<file>", "file that contains all state snapshots (default <datadir>/snapshots.img)")
 OPT_FLAG ( no_snapstorage, "do not mount a snapshot storage file (this disables all snapshot functionality)" )
 OPT_PARAM( snapshot,       "<name>", "name of snapshot within storage file for auto-start and auto-save (default 'default-boot')" )
@@ -84,8 +83,7 @@ OPT_FLAG ( no_snapshot_save, "do not auto-save to snapshot on exit: abandon chan
 OPT_FLAG ( no_snapshot_load, "do not auto-start from snapshot: perform a full boot" )
 OPT_FLAG ( snapshot_list,  "show a list of available snapshots" )
 OPT_FLAG ( no_snapshot_update_time, "do not do try to correct snapshot time on restore" )
-#endif
-OPT_FLAG ( wipe_data, "reset the use data image (copy it from initdata)" )
+OPT_FLAG ( wipe_data, "reset the user data image (copy it from initdata)" )
 CFG_PARAM( avd, "<name>", "use a specific android virtual device" )
 CFG_PARAM( skindir, "<dir>", "search skins in <dir> (default <system>/skins)" )
 CFG_PARAM( skin, "<name>", "select a given skin" )
@@ -133,7 +131,6 @@ OPT_PARAM( report_console, "<socket>", "report console port to remote socket" )
 OPT_PARAM( gps, "<device>", "redirect NMEA GPS to character device" )
 OPT_PARAM( keyset, "<name>", "specify keyset file name" )
 OPT_PARAM( shell_serial, "<device>", "specific character device for root shell" )
-OPT_FLAG ( old_system, "support old (pre 1.4) system images" )
 OPT_PARAM( tcpdump, "<file>", "capture network packets to file" )
 
 OPT_PARAM( bootchart, "<timeout>", "enable bootcharting")
